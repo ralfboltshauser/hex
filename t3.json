@@ -1,0 +1,11 @@
+{
+  "$schema": "https://t3.codes/schema/t3.json",
+  "defaultThreadEnvMode": "worktree",
+  "defaultWorktreeBaseRef": "personal",
+  "scripts": [
+    {"name": "Check personal", "command": "bash scripts/personal/check.sh", "icon": "test"},
+    {"name": "Verify", "command": "python3 scripts/personal/maintain.py verify", "icon": "test"},
+    {"name": "Build isolated app", "command": "python3 scripts/personal/maintain.py build", "icon": "build"},
+    {"name": "Update status", "command": "python3 scripts/personal/maintain.py status", "icon": "configure"}
+  ]
+}

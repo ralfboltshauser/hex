@@ -1,6 +1,16 @@
 <!-- tallow -->
 # Hex Agent Guide
 
+## Personal fork routing
+
+Read `FORK.md` first for personal features, upstream updates, builds and installation.
+Its branch and delivery policy overrides upstream maintainer-specific instructions
+below: use `personal`, preserve upstream branches, and install only on explicit
+request. Upstream's private control checkout, PR auto-merge and installed-app
+replacement instructions do not apply to this fork. Keep the upstream technical
+guidance below. Before invoking Claude Code, follow the installed
+`claude-subscription-only` skill and its guarded subscription launcher.
+
 ## Private Kit Tool
 
 `dev` and `production` take changes only through pull requests (Dax's
