@@ -118,8 +118,9 @@ class Fork:
         receipt = self.receipt(commit)
         receipt.unlink(missing_ok=True)
         logs = []
+        env = dict(os.environ, NEXTEST_TEST_THREADS='4')
         for command in (['bash', 'scripts/check'], ['bash', 'scripts/personal/check.sh']):
-            logs.append(self.logged(command))
+            logs.append(self.logged(command, env=env))
             if self.clean_head() != commit:
                 raise RuntimeError('Source changed during checks; verify again')
         save(receipt, dict(commit=commit, logs=logs))

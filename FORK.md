@@ -56,7 +56,10 @@ about ambiguous replacement/removal; mechanical repair needs no extra approval.
 
 `verify` runs upstream's complete local check command and the personal checks,
 and records successful completion for a clean commit. Failed rechecks revoke
-earlier evidence. `build` requires that evidence and copies a strictly verified
+earlier evidence. Nextest uses four concurrent tests to limit background load;
+the first unrestricted run hit a subprocess test's three-second assertion, which
+passed in isolation. No assertions or timeouts are relaxed. `build` requires
+that evidence and copies a strictly verified
 Hex Test bundle into a commit-specific artifact directory. `promote` requires both
 and pushes a normal fast-forward to `personal`. Source edits require a new check
 and build. Never force-push personal or weaken assertions to make an update pass.
