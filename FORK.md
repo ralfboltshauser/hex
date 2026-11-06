@@ -20,10 +20,16 @@ reversal/cancellation and ordinary dictation when the feature affects them.
 
 ## Intentional differences
 
-There are no personal product features yet. Fork maintenance lives only in this
-file, the personal routing paragraph in `AGENTS.md`, `t3.json`, `.gitignore`,
-`rust-toolchain.toml`, and `scripts/personal/`. Production Rust code and upstream
-build scripts are unchanged. The checkout pins Rust 1.99.1 because the 3.3.0
+Personal builds are named **Hex Ralf** in Finder and the macOS application and
+Quit menus. `maintain.py` sets `HEX_PERSONAL_BUILD=1`; the test-build packaging
+branch in `scripts/build-app.sh` and `src/app_paths.rs::app_name` use it. Ordinary
+upstream test builds still use Hex Test. Packaging verification checks both bundle
+names. This is branding only: keep `anomaly.hex.test`, `hex-test://`, the
+`hex-test` data/config folders, and update isolation unchanged so existing settings
+and macOS permission identity survive. Verify with `bash scripts/personal/check.sh`
+and the packaged build validation. Fork maintenance also lives in this file, the
+personal routing paragraph in `AGENTS.md`, `t3.json`, `.gitignore`,
+`rust-toolchain.toml`, and `scripts/personal/`. The checkout pins Rust 1.99.1 because the 3.3.0
 lockfile requires at least 1.97; keep toolchain changes separate from feature work.
 
 Personal builds use upstream's Hex Test mode: separate identity, URL scheme,
@@ -60,7 +66,7 @@ earlier evidence. Nextest uses four concurrent tests to limit background load;
 the first unrestricted run hit a subprocess test's three-second assertion, which
 passed in isolation. No assertions or timeouts are relaxed. `build` requires
 that evidence and copies a strictly verified
-Hex Test bundle into a commit-specific artifact directory. `promote` requires both
+Hex Ralf bundle into a commit-specific artifact directory. `promote` requires both
 and pushes a normal fast-forward to `personal`. Source edits require a new check
 and build. Never force-push personal or weaken assertions to make an update pass.
 
@@ -70,14 +76,14 @@ merge unfinished feature branches. Report specific failures and leave the workin
 installation alone. The T3 schedule needs this Mac awake and T3 running; the manual
 command remains available after missed runs. Use `status` to inspect saved state.
 
-Installation targets only `~/Applications/Hex Test.app`, requires it to be closed,
+Installation targets only `~/Applications/Hex Ralf.app`, requires it to be closed,
 and retains any previous bundle alongside it. It does not launch either app,
 change permissions, install the microphone driver, or copy official Hex data.
 Test microphone access, shortcut/cancel, transcription and paste in real target
 apps before daily use. Test isolation still requires one active recording owner;
 avoid competing hotkeys between official and test apps.
 
-The initial daily-use build keeps the existing Hex Test identity instead of
+The initial daily-use build uses the Hex Ralf display name with the existing Hex Test identity instead of
 inventing branding/signing infrastructure. Any future identity change must cover
 permissions, helpers, paths and updater behavior together. Before testing a new
 version on valuable test-app data, quit it and back up that data. Keeping an old

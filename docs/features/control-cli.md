@@ -1,5 +1,11 @@
 # Control the running app from a terminal
 
+Personal macOS builds display **Hex Ralf** in Finder and native application/Quit
+menus. They retain the isolated `anomaly.hex.test` identity, `hex-test` data and
+config folders, and `hex-test://` links. Upstream test builds remain Hex Test.
+Packaging validates the names and signature; native settings, permissions and
+login registration must also be checked after installation.
+
 ```ts
 Agent or terminal                                  // control.cli; every OS
 ├── One tree and protocol over the local API's POST /control on every OS;

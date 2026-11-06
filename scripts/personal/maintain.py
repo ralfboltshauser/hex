@@ -138,15 +138,15 @@ class Fork:
         destination = self.state / 'builds' / commit
         if destination.exists():
             self.artifact(commit)
-            print(destination / 'Hex Test.app')
+            print(destination / 'Hex Ralf.app')
             return
-        env = dict(os.environ, HEX_TEST_BUILD='1', HEX_LOCAL_BUILD='1', HEX_COMMIT=commit,
+        env = dict(os.environ, HEX_TEST_BUILD='1', HEX_LOCAL_BUILD='1', HEX_PERSONAL_BUILD='1', HEX_COMMIT=commit,
                    CARGO_TARGET_DIR=str(self.source / 'target'))
         env.pop('HEX_RELEASE_UNSIGNED', None)
         self.logged(['bash', 'scripts/build-app.sh'], env=env)
         if self.verified() != commit:
             raise RuntimeError('Source changed during build')
-        app = self.source / 'target/app/Hex Test.app'
+        app = self.source / 'target/app/Hex Ralf.app'
         self.validate_app(app)
         destination.parent.mkdir(exist_ok=True)
         temporary = destination.parent / f'.{commit}-{uuid.uuid4().hex}'
@@ -160,13 +160,18 @@ class Fork:
         identifier = run('/usr/libexec/PlistBuddy', '-c', 'Print :CFBundleIdentifier',
                          str(app / 'Contents/Info.plist'))
         if identifier != 'anomaly.hex.test':
-            raise RuntimeError('Only isolated Hex Test bundles may be installed')
+            raise RuntimeError('Only isolated Hex Ralf bundles may be installed')
+        for key in ('CFBundleName', 'CFBundleDisplayName'):
+            name = run('/usr/libexec/PlistBuddy', '-c', f'Print :{key}',
+                       str(app / 'Contents/Info.plist'))
+            if name != 'Hex Ralf':
+                raise RuntimeError(f'Expected Hex Ralf for {key}, got {name}')
         run('codesign', '--verify', '--deep', '--strict', str(app))
 
     def artifact(self, commit):
         directory = self.state / 'builds' / commit
         receipt = json.loads((directory / 'build.json').read_text())
-        app = directory / 'Hex Test.app'
+        app = directory / 'Hex Ralf.app'
         if receipt['commit'] != commit or receipt['sha256'] != digest(app):
             raise RuntimeError('Build artifact changed; preserve it and rebuild')
         self.validate_app(app)
@@ -184,17 +189,17 @@ class Fork:
     def install(self):
         commit = self.verified()
         app = self.artifact(commit)
-        destination = Path.home() / 'Applications/Hex Test.app'
+        destination = Path.home() / 'Applications/Hex Ralf.app'
         processes = run('ps', '-axo', 'command=')
         if str(destination / 'Contents/MacOS/hex') in processes:
-            raise RuntimeError('Quit Hex Test before installing; no process was stopped')
+            raise RuntimeError('Quit Hex Ralf before installing; no process was stopped')
         destination.parent.mkdir(exist_ok=True)
-        temporary = destination.parent / f'.Hex-Test-{uuid.uuid4().hex}.app'
+        temporary = destination.parent / f'.Hex-Ralf-{uuid.uuid4().hex}.app'
         shutil.copytree(app, temporary, symlinks=True)
         self.validate_app(temporary)
         previous = None
         if destination.exists():
-            previous = destination.parent / f'Hex Test Backup-{uuid.uuid4().hex}.app'
+            previous = destination.parent / f'Hex Ralf Backup-{uuid.uuid4().hex}.app'
             destination.rename(previous)
         try:
             temporary.rename(destination)
