@@ -24,7 +24,7 @@ Personal builds are named **Hex Ralf** in Finder and the macOS application and
 Quit menus. `maintain.py` sets `HEX_PERSONAL_BUILD=1`; the test-build packaging
 branch in `scripts/build-app.sh` and `src/app_paths.rs::app_name` use it. Ordinary
 upstream test builds still use Hex Test. Packaging verification checks both bundle
-names. This is branding only: keep `anomaly.hex.test`, `hex-test://`, the
+names. Keep `anomaly.hex.test`, `hex-test://`, the
 `hex-test` data/config folders, and update isolation unchanged so existing settings
 and macOS permission identity survive. Verify with `bash scripts/personal/check.sh`
 and the packaged build validation. Fork maintenance also lives in this file, the
@@ -36,6 +36,18 @@ Personal builds use upstream's Hex Test mode: separate identity, URL scheme,
 data and config, with official binary updates disabled. Preserve these properties
 when upstream changes packaging, paths or updater logic. Daily maintenance never
 replaces official Hex or installs a candidate.
+
+Personal bundles and their nested helper/driver use Ralf's Developer ID
+Application certificate (team `76625SQ67N`), with a secure timestamp and hardened
+runtime. `maintain.py` pins the team and validates an Apple-issued Developer ID
+signature for `anomaly.hex.test`; missing signing credentials fail the build
+rather than falling back to ad-hoc signing. Ordinary upstream test builds remain
+ad-hoc signed. Keep the bundle identifier, signing team and designated requirement
+compatible across updates so macOS can retain privacy approvals. The one-time
+transition from the original ad-hoc build may require reapproval; actual retention
+still needs observation across an installed update. This does not add notarization.
+`scripts/personal/check.sh` checks that two different signed executables satisfy
+each other's designated requirements and rejects a different app identifier.
 
 ## Update and delivery
 

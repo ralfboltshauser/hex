@@ -5,6 +5,11 @@ menus. They retain the isolated `anomaly.hex.test` identity, `hex-test` data and
 config folders, and `hex-test://` links. Upstream test builds remain Hex Test.
 Packaging validates the names and signature; native settings, permissions and
 login registration must also be checked after installation.
+Personal builds now use Ralf's Developer ID team `76625SQ67N` with the existing
+bundle ID, preserving a compatible code-signing requirement across updates.
+The transition from ad-hoc signing can require one final privacy approval.
+The personal signing regression verifies requirement compatibility between
+different executables; it does not establish observed macOS permission retention.
 
 ```ts
 Agent or terminal                                  // control.cli; every OS

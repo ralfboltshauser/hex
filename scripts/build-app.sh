@@ -6,6 +6,8 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # HEX_TEST_BUILD=1 builds the CI test app: ad-hoc signed, under its own
 # name and bundle ID so it installs beside the released Hex and never
 # touches its permissions; it never checks for updates.
+# Personal builds retain that isolation but use their Developer ID signing team
+# so privacy approvals can survive a change to the executable.
 # HEX_LOCAL_BUILD=1 marks a build made from a checkout for its owner's own
 # machine (Developer ID signed as usual): it shows "Local build · updates off"
 # with its commit and never checks for or offers updates.
@@ -21,7 +23,11 @@ elif [ "${HEX_TEST_BUILD:-}" = 1 ]; then
   team_id=
   identity=-
   app_name="Hex Test"
-  [ "${HEX_PERSONAL_BUILD:-}" = 1 ] && app_name="Hex Ralf"
+  if [ "${HEX_PERSONAL_BUILD:-}" = 1 ]; then
+    team_id=${HEX_TEAM_ID:?Set HEX_TEAM_ID to the Apple Developer signing team}
+    identity=$(hex_codesign_identity "$team_id")
+    app_name="Hex Ralf"
+  fi
   bundle_id=anomaly.hex.test
 else
   team_id=${HEX_TEAM_ID:?Set HEX_TEAM_ID to the Apple Developer signing team}

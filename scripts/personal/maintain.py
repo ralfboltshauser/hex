@@ -13,6 +13,14 @@ import sys
 import uuid
 
 
+PERSONAL_TEAM_ID = '76625SQ67N'
+PERSONAL_REQUIREMENT = (
+    'identifier "anomaly.hex.test" and anchor apple generic '
+    f'and certificate leaf[subject.OU] = "{PERSONAL_TEAM_ID}" '
+    'and certificate leaf[field.1.2.840.113635.100.6.1.13] exists'
+)
+
+
 def run(*args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, text=True).strip()
 
@@ -140,7 +148,8 @@ class Fork:
             self.artifact(commit)
             print(destination / 'Hex Ralf.app')
             return
-        env = dict(os.environ, HEX_TEST_BUILD='1', HEX_LOCAL_BUILD='1', HEX_PERSONAL_BUILD='1', HEX_COMMIT=commit,
+        env = dict(os.environ, HEX_TEST_BUILD='1', HEX_LOCAL_BUILD='1', HEX_PERSONAL_BUILD='1',
+                   HEX_TEAM_ID=PERSONAL_TEAM_ID, HEX_COMMIT=commit,
                    CARGO_TARGET_DIR=str(self.source / 'target'))
         env.pop('HEX_RELEASE_UNSIGNED', None)
         self.logged(['bash', 'scripts/build-app.sh'], env=env)
@@ -167,6 +176,7 @@ class Fork:
             if name != 'Hex Ralf':
                 raise RuntimeError(f'Expected Hex Ralf for {key}, got {name}')
         run('codesign', '--verify', '--deep', '--strict', str(app))
+        run('codesign', '--verify', '--strict', '-R', '=' + PERSONAL_REQUIREMENT, str(app))
 
     def artifact(self, commit):
         directory = self.state / 'builds' / commit
