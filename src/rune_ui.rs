@@ -36,7 +36,11 @@ mod live_notes;
 pub(crate) mod live_text;
 pub(crate) mod meeting_capsules;
 mod meetings;
+pub(crate) use self::meetings::meeting_import_failed;
+#[cfg(hex_capture)]
+mod captures;
 mod meetings_host;
+pub(crate) use meetings_host::{meeting_corner_moved, meeting_failed, meeting_provider_chosen};
 mod model_details;
 mod model_import;
 mod models;
@@ -53,12 +57,16 @@ mod practice;
 mod scenes;
 #[cfg(hex_capture)]
 mod scrawl;
+#[cfg(hex_capture)]
+pub(crate) mod screenshot_thumbnail;
 mod settings;
 mod shortcut_mode;
+mod shortcut_rule;
 mod sidebar;
 mod sidebar_update;
 mod sound_sets;
 mod spark;
+mod speech_model;
 #[cfg(target_os = "macos")]
 pub(crate) mod story_link;
 mod vocabulary;
@@ -82,7 +90,8 @@ use host::{Backend, Request, ShortcutTarget};
 use onboarding_kit::live::Page;
 use scenes::{SCENES, Scene, fixture, mac_fixture, portal_fixture};
 use settings::Capture;
-use sidebar::{BuildKind, Pane, sidebar, title_bar};
+pub(crate) use shortcut_rule::shortcut_rule;
+use sidebar::{BuildKind, Pane, pane_header, sidebar};
 
 /// How long typing pauses before a text field's edit is saved.
 const DRAFT_DELAY: Duration = Duration::from_millis(250);
@@ -103,7 +112,9 @@ pub(crate) fn run_app(
 ) {
     use crate::linux::service::{Activation, Control};
     rune::set_app_id(crate::linux::portal::APP_ID);
-    let mut app = self::app(Some(host.clone())).args(Vec::new()).windowless();
+    let mut app = self::app(Some(host.clone()))
+        .args(window_args())
+        .windowless();
     // Tiling window managers float a window that maps at a fixed size.
     // Desktops that float every window need no such map, and KWin on X11
     // keeps a fixed-size window from fitting a small screen, its title bar
@@ -178,6 +189,15 @@ pub(crate) fn app(connect: host::Connect) -> rune::App<Ui> {
     app
 }
 
+/// Rune's flags for the window on Linux and Windows: scroll bars show
+/// whenever there's more to scroll, as those platforms do, so a pointer
+/// without a wheel can reach them (#1209). macOS follows its own "Show scroll
+/// bars" setting.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) fn window_args() -> Vec<String> {
+    vec!["--scroll-bars".into(), "always".into()]
+}
+
 /// Beside a setting an organization locked (`crate::policy`).
 fn managed_note() -> &'static str {
     tr("Managed by your organization")
@@ -217,6 +237,11 @@ pub(crate) fn render_app(rune_args: Vec<String>) -> rune::App<Ui> {
         .iter()
         .any(|arg| arg == "--snap" || arg == "--video" || arg == "--list-scenes");
     onboarding_kit::set_live_window(playground && !headless);
+    // A render is in English unless `HEX_RENDER_LANGUAGE` names an
+    // interface language (`ru`, `pl`, …) to check its copy in.
+    if let Ok(code) = std::env::var("HEX_RENDER_LANGUAGE") {
+        crate::desktop::i18n::apply(Some(&code));
+    }
     // Fixtures only: a render never reads, migrates, or saves the user's
     // settings, History, or anything else in the data folder.
     let app = build(
@@ -245,8 +270,10 @@ pub(crate) fn render_app(rune_args: Vec<String>) -> rune::App<Ui> {
 #[derive(Default)]
 pub(crate) struct WindowCompositor {
     onboarding: Option<onboarding_kit::gpu_stage::OnboardingGpu>,
-    game: Option<onboarding_kit::game_fx::GameFx>,
+    game: Option<onboarding_kit::game::fx::GameFx>,
     sounds: sound_sets::Preview,
+    /// The device whose backend `process.log` names.
+    logged: Option<rune::compose::DeviceKey>,
 }
 
 impl rune::compose::Compositor<Ui> for WindowCompositor {
@@ -256,34 +283,33 @@ impl rune::compose::Compositor<Ui> for WindowCompositor {
     }
 
     fn render(&mut self, f: &mut rune::compose::Frame<'_, Ui>) {
+        if self.logged != Some(f.device_key()) {
+            self.logged = Some(f.device_key());
+            tracing::info!(gpu = %rune::describe_gpu(f.device), "window draws");
+        }
         if f.rt
             .marks
             .iter()
-            .any(|&m| onboarding_kit::game_fx::is_game_mark(m))
+            .any(|&m| onboarding_kit::game::fx::is_game_mark(m))
         {
+            // The game's HUD is onboarding's: its draw hook paints both.
+            let hud = onboarding_kit::gpu_stage::OnboardingGpu::for_frame(&mut self.onboarding, f);
             self.game
-                .get_or_insert_with(|| onboarding_kit::game_fx::GameFx::new(f.device))
-                .render(f);
+                .get_or_insert_with(|| onboarding_kit::game::fx::GameFx::new(f.device))
+                .render(f, hud);
         } else if self.onboarding.is_some()
             || f.rt
                 .marks
                 .iter()
                 .any(|&m| onboarding_kit::gpu_stage::is_onboard_mark(m))
         {
-            if self
-                .onboarding
-                .as_ref()
-                .is_none_or(|g| !g.matches(f.format))
-            {
-                self.onboarding = Some(onboarding_kit::gpu_stage::OnboardingGpu::new(
-                    f.device, f.format,
-                ));
-            }
-            self.onboarding.as_mut().expect("created above").render(f);
+            onboarding_kit::gpu_stage::warm_later_pipelines(f.device, f.format);
+            onboarding_kit::gpu_stage::OnboardingGpu::for_frame(&mut self.onboarding, f).render(f);
         } else {
             f.draw_ui();
         }
         self.sounds.render(f);
+        onboarding_kit::live::frame_drawn();
     }
 }
 
@@ -333,15 +359,17 @@ fn build(init: impl FnOnce() -> Ui + 'static, playground: PlaygroundMode) -> run
 
 /// Closing the window saves pending text edits and stops a shortcut
 /// recording, as leaving a pane does. Hex keeps running.
-fn on_close(ui: &mut Ui, _: &mut Tx) {
+fn on_close(ui: &mut Ui, tx: &mut Tx) {
     ui.flush_drafts();
     settings::cancel_capture(ui);
+    // A hidden window only polls when woken, so poll's visibility check
+    // cannot stop a playback that was running when it closed.
+    if let Some(playback) = &mut ui.history.playback {
+        playback.stop();
+    }
     ui.open = None;
     models::close(ui);
-    picker::close(ui);
-    explainer::close(ui);
-    sound_sets::close(ui);
-    vocabulary::close(ui);
+    ui.close_dialogs();
     // HUD Lab's demo would otherwise stay on screen; reopening starts at
     // General, and coming back to HUD Lab starts the demo again.
     if ui.pane == Pane::HudLab {
@@ -351,8 +379,13 @@ fn on_close(ui: &mut Ui, _: &mut Tx) {
     if let Service::Live(backend) = &mut ui.service {
         backend.closed();
     }
+    // Windows destroys the closed window, so the next open makes a new one.
+    #[cfg(target_os = "windows")]
+    crate::windows::rune::keep_window_frame(tx);
     #[cfg(target_os = "macos")]
     crate::macos_rune::window_closed();
+    #[cfg(not(target_os = "windows"))]
+    let _ = tx;
 }
 
 /// Where the menu bar, a meeting, or a `hex window show` sends the window.
@@ -389,10 +422,7 @@ pub(crate) fn show(ui: &mut Ui, destination: Destination, tx: &mut Tx) {
         Destination::Modes => Pane::Output,
         Destination::History => Pane::History,
     };
-    picker::close(ui);
-    explainer::close(ui);
-    sound_sets::close(ui);
-    vocabulary::close(ui);
+    ui.close_dialogs();
     if pane.shown(ui) {
         ui.select_pane(pane, tx);
     }
@@ -440,29 +470,6 @@ pub(crate) fn current_pane(ui: &Ui) -> &'static str {
     }
 }
 
-/// The OS's rules for a shortcut, the ones Settings applies when recording
-/// one; shared with `hex settings set`.
-pub(crate) fn shortcut_rule(
-    slot: crate::app_settings::HotkeySlot,
-    binding: &HotkeyBinding,
-) -> Result<(), &'static str> {
-    use crate::app_settings::HotkeySlot;
-    let target = match slot {
-        HotkeySlot::Dictation => ShortcutTarget::Dictation,
-        HotkeySlot::PasteLast => ShortcutTarget::PasteLast,
-        HotkeySlot::RawDictation => ShortcutTarget::RawDictation,
-        #[cfg(hex_capture)]
-        HotkeySlot::Capture => ShortcutTarget::Capture,
-        #[cfg(target_os = "macos")]
-        HotkeySlot::SecondDictation => ShortcutTarget::SecondDictation,
-        // Labs › Second dictation shortcut is macOS's; elsewhere a saved one
-        // meets the dictation shortcut's rules.
-        #[cfg(not(target_os = "macos"))]
-        HotkeySlot::SecondDictation => ShortcutTarget::Dictation,
-    };
-    host::validate_hotkey(target, binding)
-}
-
 /// The key `name` names on the active keyboard layout ("v", "space", "f5").
 #[cfg(target_os = "macos")]
 pub(crate) fn hotkey_key_named(name: &str) -> Result<HotkeyKey, &'static str> {
@@ -484,24 +491,6 @@ pub(crate) fn shortcut_rules() -> crate::control::settings::ShortcutRules {
     }
 }
 
-/// A capsule's "Never offer" or "Always record" choice, kept in the window's
-/// live settings so its next save doesn't drop it.
-pub(crate) fn meeting_provider_chosen(
-    ui: &mut Ui,
-    choice: crate::app_settings::MeetingProviderChoice,
-) {
-    crate::app_settings::set_meeting_provider(&mut ui.settings.meetings, choice);
-}
-
-/// The corner the recording capsule was dragged to, kept in the window's live
-/// settings so its next save doesn't move it back.
-pub(crate) fn meeting_corner_moved(
-    ui: &mut Ui,
-    corner: crate::app_settings::MeetingIndicatorCorner,
-) {
-    ui.settings.meetings.recording_indicator_corner = corner;
-}
-
 /// An error from outside the window, such as settings that could not be read
 /// at launch, shown where save errors show.
 #[cfg(target_os = "macos")]
@@ -509,11 +498,10 @@ pub(crate) fn show_error(ui: &mut Ui, error: String) {
     ui.error = Some(error);
 }
 
-/// A meeting recording could not start or finish; the Meetings pane says why.
-pub(crate) fn meeting_failed(ui: &mut Ui, error: String) {
-    ui.meetings.start_pending = false;
-    ui.meetings.stop_pending = false;
-    ui.meetings.runtime_error = Some(error);
+/// The menu bar asked for an update check: the footer says how it went.
+#[cfg(target_os = "macos")]
+pub(crate) fn update_check_asked(ui: &mut Ui) {
+    ui.update_asked = true;
 }
 
 /// `hex app -- --snap out.png --scene …`: a headless render of a fixture
@@ -590,6 +578,8 @@ struct ServiceView {
     transcription: DesktopTranscriptionSnapshot,
     update_status: DesktopUpdateStatus,
     update_notes: Option<crate::desktop::host::UpdateNotes>,
+    /// Why this Hex can't update itself, beside Download update (Windows).
+    update_blocked: Option<&'static str>,
     /// The service is recording or saving a shortcut.
     editing: bool,
 }
@@ -602,8 +592,16 @@ enum Menu {
     InputSourceModel(usize),
     /// An input source's language in keyboard model switching.
     InputSourceLanguage(usize),
+    /// A mode's speech model in the Modes pane (Labs › Switch model with app).
+    ModeSpeechModel(modes::Selection),
+    /// A mode's speech language in the Modes pane.
+    ModeSpeechLanguage(modes::Selection),
     /// How long History keeps dictations.
     HistoryRetention,
+    /// The installed models History's Transcribe again offers.
+    HistoryAgain,
+    /// The language of Transcribe again's chosen model, for that run.
+    HistoryAgainLanguage,
     /// The OpenCode thinking variant.
     Variant,
     /// The selected meeting's overflow menu.
@@ -623,6 +621,9 @@ enum Menu {
 
 pub(crate) struct Ui {
     settings: AppSettings,
+    /// A test's preferred system language, instead of the host locale.
+    #[cfg(test)]
+    preferred_language: Option<String>,
     service: Service,
     /// This window's app, to know whether it shows (`app` sets it).
     window: Option<rune::AppHandle<Ui>>,
@@ -652,12 +653,14 @@ pub(crate) struct Ui {
     microphones_listing:
         Option<std::sync::mpsc::Receiver<Result<crate::audio::InputDevices, String>>>,
     mic_level: general::MicLevel,
+    /// General's search, while Labs › Settings search is on.
+    general_search: TextEdit,
     /// The panes whose Advanced fold is open.
     advanced: Vec<Pane>,
     /// The Labs page shows in place of a pane.
     labs_open: bool,
-    /// The Labs row a link just opened, pulsing until it is cleared.
-    lab_flash: Option<(crate::labs::Feature, Instant)>,
+    /// The Labs store's search, tab, and chip.
+    lab_store: labs::Store,
     /// A scene previewing the badge of a build kind this binary is not.
     build_preview: Option<BuildKind>,
     capture: Capture,
@@ -669,6 +672,8 @@ pub(crate) struct Ui {
     duck_volume_drag: Option<f32>,
     models: models::Models,
     history: history::HistoryPane,
+    #[cfg(hex_capture)]
+    captures: captures::CapturesPane,
     modes: modes::ModesPane,
     output: output::OutputPane,
     picker: picker::Picker,
@@ -692,6 +697,9 @@ pub(crate) struct Ui {
     /// Settings saves and Quit Hex a fixture recorded.
     saved: usize,
     quit_requested: bool,
+    /// The person asked for an update check (the footer or the menu bar),
+    /// so the footer says how it went.
+    update_asked: bool,
 }
 
 /// Which of the window's text editors hold unsaved typing.
@@ -718,11 +726,15 @@ impl Ui {
         let store = host::history(&connect, settings.history_retention);
         #[cfg(target_os = "linux")]
         let paste = connect.is_some().then(paste_access::detect).flatten();
+        #[cfg(target_os = "linux")]
+        let clipboard_unrestorable =
+            connect.is_some() && crate::linux::clipboard::wayland_without_data_control();
         let mut ui = Self::with(settings, Service::Pending(connect));
         ui.error = error;
         #[cfg(target_os = "linux")]
         {
             ui.platform.paste = paste;
+            ui.platform.clipboard_unrestorable = clipboard_unrestorable;
         }
         // A mouse-button shortcut went back to its default: say so once.
         if ui.settings.mouse_shortcut_notice {
@@ -751,6 +763,8 @@ impl Ui {
         let vocabulary = vocabulary::VocabularyEditor::new(&settings.vocabulary);
         Self {
             settings,
+            #[cfg(test)]
+            preferred_language: None,
             service,
             view: None,
             error: None,
@@ -764,9 +778,10 @@ impl Ui {
             input_sources_listed_at: f64::NEG_INFINITY,
             microphones_listing: None,
             mic_level: general::MicLevel::default(),
+            general_search: TextEdit::default(),
             advanced: Vec::new(),
             labs_open: false,
-            lab_flash: None,
+            lab_store: labs::Store::default(),
             build_preview: None,
             capture: Capture::Idle,
             vocabulary,
@@ -775,6 +790,8 @@ impl Ui {
             duck_volume_drag: None,
             models: models::Models::default(),
             history: history::HistoryPane::default(),
+            #[cfg(hex_capture)]
+            captures: captures::CapturesPane::default(),
             modes,
             output: output::OutputPane::default(),
             picker: picker::Picker::default(),
@@ -792,6 +809,7 @@ impl Ui {
             hud_saved: false,
             saved: 0,
             quit_requested: false,
+            update_asked: false,
             window: None,
             tick_at: 0.0,
         }
@@ -804,6 +822,16 @@ impl Ui {
     /// A scene or test: nothing here runs on real time.
     fn is_fixture(&self) -> bool {
         matches!(self.service, Service::Fixture(_))
+    }
+
+    /// The person's first preferred system language: a test's when it sets
+    /// one, else the host locale.
+    fn preferred_language(&self) -> String {
+        #[cfg(test)]
+        if let Some(language) = &self.preferred_language {
+            return language.clone();
+        }
+        crate::desktop::i18n::preferred_language()
     }
 
     fn send(&mut self, request: Request) {
@@ -1060,6 +1088,15 @@ impl Ui {
         }
     }
 
+    /// Closes the dialogs and sheets a pane switch or window close ends.
+    fn close_dialogs(&mut self) {
+        picker::close(self);
+        explainer::close(self);
+        sound_sets::close(self);
+        vocabulary::close(self);
+        history::close_stats(self);
+    }
+
     /// Switches panes at once: the new pane replaces the old without a fade,
     /// already at rest (a grant's morph doesn't replay).
     fn select_pane(&mut self, pane: Pane, tx: &mut Tx) {
@@ -1071,11 +1108,9 @@ impl Ui {
         self.flush_drafts();
         settings::cancel_capture(self);
         self.open = None;
+        self.general_search.clear();
         models::close(self);
-        picker::close(self);
-        explainer::close(self);
-        sound_sets::close(self);
-        vocabulary::close(self);
+        self.close_dialogs();
         self.output.prompt_copied = false;
         if self.pane == Pane::HudLab {
             self.ask(platform::PlatformRequest::EndHudDemo);
@@ -1112,12 +1147,17 @@ fn on_key(ui: &mut Ui, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
         ui.quit();
         return true;
     }
+    // ⌘F (Ctrl+F off macOS) searches Labs or General.
+    if general::focus_search_key(ui, event) {
+        return true;
+    }
     if let rune::Key::Command(digit @ '1'..='9') = event.key
         && !event.mods.alt
         && !ui.picker.open
         && !ui.explainer.open
         && !ui.sound_sets.open
         && !ui.vocabulary.open
+        && !ui.history.stats_open
         && ui.tour.is_none()
     {
         let index = digit as usize - '1' as usize;
@@ -1129,6 +1169,11 @@ fn on_key(ui: &mut Ui, event: &rune::KeyEvent, tx: &mut Tx) -> bool {
     }
     if event.key != rune::Key::Escape {
         return false;
+    }
+    if let Some(s) = ui.first_run.as_mut()
+        && s.skip_scene()
+    {
+        return true;
     }
     if ui.explainer.open {
         explainer::close(ui);
@@ -1184,6 +1229,8 @@ fn local_meetings(ui: &mut Ui) -> bool {
 fn setup(ui: &mut Ui, waker: Waker) {
     ui.modes.waker = Some(waker.clone());
     ui.modes.icon_cache = Some(rune::ImageCache::new(waker.clone()));
+    #[cfg(hex_capture)]
+    ui.captures.set_cache(rune::ImageCache::new(waker.clone()));
     if let Service::Pending(connect) = &mut ui.service {
         let connect = std::mem::take(connect);
         #[cfg(target_os = "macos")]
@@ -1210,14 +1257,21 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     let now = Instant::now();
     let mut changed = ui.save_drafts(now);
     changed |= paste_access::poll(ui);
-    changed |= labs::poll_flash(ui, now);
-    // The OpenCode catalog is read only while the pane that uses it shows.
+    // The OpenCode catalog is read only while a pane that uses it shows:
+    // Modes, or Meetings › Settings while OpenCode writes the summaries.
     changed |= ui.models.poll(
         ui.live()
-            && ui.pane == Pane::Modes
+            && (ui.pane == Pane::Modes || platform_settings::summary_model_shown(ui))
             && ui.window.as_ref().is_some_and(rune::AppHandle::is_visible),
     );
-    changed |= ui.history.poll(ui.pane == Pane::History);
+    changed |= ui.history.poll(
+        ui.pane == Pane::History
+            && !ui.labs_open
+            && ui.window.as_ref().is_none_or(rune::AppHandle::is_visible),
+        ui.settings.labs.keep_recordings,
+    );
+    #[cfg(hex_capture)]
+    let mut changed = ui.captures.poll(ui.pane == Pane::Captures && !ui.labs_open) | changed;
     if ui.pane == Pane::Output && !ui.labs_open {
         changed |= output::poll(ui, clock, tx);
     }
@@ -1235,6 +1289,7 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
     changed |= ui.modes.poll(ui.live());
     changed |= modes::poll_chooser(ui);
     changed |= model_import::poll(ui);
+    changed |= meetings::poll_import(ui);
     changed |= found::poll(ui);
     let login_unknown = ui.platform.login_item.is_none();
     changed |= settings::poll_microphones(ui);
@@ -1322,19 +1377,25 @@ fn poll(ui: &mut Ui, clock: f64, tx: &mut Tx) -> bool {
 // View
 
 fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
-    let p = Paint::new(cx.system_dark(), cx.env().scale);
-    // The native title bar takes the window's background, so it follows a
-    // system theme switch along with the rest of the window.
+    let dark = crate::labs::window_dark(&ui.settings.labs, cx.system_dark());
+    let p = Paint::new(dark, cx.env().scale);
+    // The native title bar takes the window's background and light/dark mode,
+    // so its text and buttons stay readable while Labs › Appearance forces a
+    // theme. winit repaints the frame from the OS theme on every settings
+    // broadcast, so `match_title_bar` records this frame's theme and a window
+    // subclass re-applies it after each one while a theme is forced.
     #[cfg(target_os = "windows")]
-    crate::windows::rune::match_title_bar(p.k.c.bg_deep);
+    crate::windows::rune::match_title_bar(p.k.c.bg_deep, dark, cx.system_dark());
     // Menus and popovers mount above the page (rune-kit overlays).
     let mut layer = Vec::new();
     let (actions, body) = match ui.pane {
-        _ if ui.labs_open => (Vec::new(), labs::page(ui, p)),
+        _ if ui.labs_open => (vec![labs::tabs(ui, p)], labs::page(ui, p)),
         Pane::General => (Vec::new(), general::pane(ui, p, &mut layer)),
         Pane::Output => (Vec::new(), output::pane(ui, p, cx.is_reduced_motion())),
         Pane::Modes => modes::pane(ui, p, &mut layer),
         Pane::History => history::pane(ui, p, &mut layer),
+        #[cfg(hex_capture)]
+        Pane::Captures => (Vec::new(), captures::pane(ui, p)),
         Pane::Meetings => meetings::pane(ui, p, &mut layer),
         #[cfg(hex_capture)]
         Pane::Annotate => (Vec::new(), scrawl::pane(ui, p, &mut layer)),
@@ -1344,6 +1405,7 @@ fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     };
     let panel = col()
         .key("panel")
+        .role("main")
         .grow(1.0)
         .shrink()
         .mt(8.0)
@@ -1362,15 +1424,21 @@ fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
             } else {
                 ui.pane.title()
             },
-            (ui.pane == Pane::Meetings && !ui.labs_open)
-                .then(|| meetings::view_switch(ui, p))
-                .flatten(),
+            if ui.labs_open {
+                Some(labs::search_field(ui, p))
+            } else {
+                (ui.pane == Pane::Meetings)
+                    .then(|| meetings::view_switch(ui, p))
+                    .flatten()
+            },
             actions,
         ))
         .child(body);
+    // The OS window is the accessibility tree's root; this box adds nothing
+    // to it.
     let window = row()
         .key("window")
-        .role("window")
+        .role("none")
         .fill(p.k.c.bg_deep)
         .hover_motion_within(Anim::INSTANT, Anim::INSTANT)
         .child(sidebar(ui, p))
@@ -1408,28 +1476,6 @@ fn window_focused(ui: &mut Ui, focused: bool, tx: &mut Tx) {
     }
 }
 
-/// The title bar of the content panel: the title, a view switch that stays
-/// beside it, and the pane's actions on the right.
-fn pane_header(p: Paint, title: &str, switch: Option<El>, actions: Vec<El>) -> El {
-    title_bar(row())
-        .key("pane-header")
-        .h(52.0)
-        .px(METRICS.gutter)
-        .gap(8.0)
-        .center_y()
-        .child(
-            text(title)
-                .key("pane-title")
-                .font(p.k.ty.body_medium)
-                .color(p.text())
-                .shrink()
-                .truncate(),
-        )
-        .children(switch.map(|switch| switch.ml(8.0)))
-        .child(el().key("header-spacer").grow(1.0))
-        .children(actions)
-}
-
 /// How far a scroll body's top and bottom edges fade out.
 const SCROLL_FADE: (f32, f32) = (4.0, 24.0);
 
@@ -1437,36 +1483,33 @@ const SCROLL_FADE: (f32, f32) = (4.0, 24.0);
 /// sits clear of the fades, so the first and last borders, rings, and fills
 /// are never cut; content needing room beside the edges (bordered cards)
 /// pads itself horizontally.
-fn scroll_body(key: &str, content: El) -> El {
-    faded_body(key, content, SCROLL_FADE)
+fn scroll_body(k: &rune_kit::Kit, key: &str, content: El) -> El {
+    faded_body(k, key, content, SCROLL_FADE)
 }
 
-/// A [`scroll_body`] with its own top and bottom fades.
-fn faded_body(key: &str, content: El, (top, bottom): (f32, f32)) -> El {
-    col()
-        .key(key)
-        .grow(1.0)
-        .shrink()
-        // Shrinks below its content in a fixed-height parent (#906).
-        .min_h(0.0)
-        .clip_fade(0.0, top, 0.0, bottom)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(col().key("inset").pt(top).pb(bottom).child(content))
+/// A [`scroll_body`] with its own top and bottom fades, and a scroll bar to
+/// drag while it overflows (#1209).
+fn faded_body(k: &rune_kit::Kit, key: &str, content: El, fades: (f32, f32)) -> El {
+    list_detail::faded_body_sticky(k, key, content, fades, false)
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, hex_capture))]
 mod offscreen;
+
+#[cfg(test)]
+mod accessibility_tests;
 
 #[cfg(test)]
 mod snap_isolation;
 
 #[cfg(test)]
 mod keyboard_model_tests;
+
+#[cfg(test)]
+mod speech_model_tests;
 
 #[cfg(test)]
 mod dmg_keycap;

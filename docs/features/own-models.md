@@ -12,30 +12,76 @@ didn't pin.
 ```ts
 Picker header -> "Add model file…" -> native dialog (GGUF, All files)   // setup.custom-models
 ├── Header check, before anything loads (transcription::gguf_header): GGUF v2/v3;
-│   general.architecture parakeet | whisper | qwen3_asr | cohere_asr | sensevoice;
+│   general.architecture parakeet | whisper | qwen3_asr | cohere_asr | sensevoice |
+│   gigaam (any other, e.g. llama.cpp's or SenseVoice.cpp's `sensevoice-small`,
+│   says the file was made for another program and needs a transcribe.cpp
+│   conversion, or the catalog's download; #1299);
 │   stt.variant; general.languages with a code Hex knows; only F32, F16, and
 │   Q8_0 tensors (the types every build runs on Metal and Vulkan); the tensor
 │   data fits the file. Anything else -> "<file> can't be imported: <reason>"
 ├── Copy -> models/custom/<16 hex>.gguf while hashing; the copy is checked again;
-│   receipt <16 hex>.gguf.verified.json (size, SHA-256, mtime, file ID where
-│   the OS reports one); manifest <16 hex>.json (name, general.name, family,
+│   receipt <16 hex>.gguf.verified.json (size, SHA-256, mtime, inode where
+│   the OS reports one, never the volume's device number, which macOS can
+│   renumber at a restart; older receipts' file_id is ignored); manifest <16 hex>.json (name, general.name, family,
 │   variant, languages, detection, file name, licence, repo URL). The original
 │   is never touched; a failed or cancelled import removes only its partial
 │   copy; the same file again keeps the first import
 ├── ID custom-<first 16 hex of the SHA-256> (TranscriptionModelId::Custom)
 ├── Card -> name from general.name (Rename edits it), languages from the file,
-│   offline only (no streaming), Parakeet without language prompt or Auto,
-│   no benchmark; Use prepares it like a catalog model (verifies Hex's copy
-│   against its receipt instead of downloading)
+│   offline only (no streaming), no language prompt for a no-hint family,
+│   Auto when its header says it detects the language (as Parakeet v3-type
+│   files do), no benchmark; Use prepares it like a catalog model (verifies
+│   Hex's copy against its receipt instead of downloading). General's Language menu
+│   lists every language the file declares: Hex's usual list first, then the
+│   rest of Whisper's codes by English name (Norwegian `no`, Norwegian
+│   Nynorsk `nn`, …; #1148)
 ├── Remove -> Hex's copy, receipt, and manifest only; not the active model
-├── Changed -> "Check again" rehashes the copy: the recorded SHA-256 again ->
-│   new receipt, ready; else it stays changed. Missing or changed -> "Import
-│   again…": the same file replaces the copy and keeps the import's name
+├── Changed (a copy replaced by a link or hard link to the same file reads as
+│   changed: its file ID and mtime moved) -> "Check again" rehashes the file:
+│   the recorded SHA-256 again -> new receipt, ready; else it stays changed.
+│   Missing or changed -> "Import again…": the same file replaces the copy and
+│   keeps the import's name
+├── The selected import missing or changed -> its card is not In use and
+│   shows only Check again / Import again… (no Rename or Remove); a check or
+│   import that succeeds asks for it again (ChooseModel), so the listener
+│   leaves the fallback for it
 └── Saved import missing or changed (size, mtime, or file ID) -> the choice
     stays saved; the listener runs a downloaded fallback (the system language's
     recommendation if downloaded, else the first downloaded catalog model;
-    custom_models::runnable); General's model row says so; the card warns
+    custom_models::runnable); General's model row names the fallback and says
+    to check it again in the picker (not "can't listen until downloaded",
+    while the fallback is downloaded); the card warns
 ```
+
+With Labs › Model in use first on, an import in use when the picker opens
+leads Every model, and "Your model files" shows above the language's group
+([labs.md](labs.md)).
+
+## Use A Model File Where It Is (Labs)
+
+```ts
+Labs › Use model files where they are on (labs.model_in_place, off by default)  // labs.model-in-place
+Picker header -> "Use model file where it is…" beside "Add model file…" -> the same dialog
+├── Gate: the button shows only while the toggle is on, and the add starts only
+│   if it is still on when the dialog answers (model_import::in_place_on)
+├── custom_models::add_in_place on a worker: the import's header check, one full
+│   SHA-256, receipt and manifest (with the file's path, no Hugging Face origin)
+│   in models/custom/; nothing copied, nothing written near the file
+├── The same file imported by copy before -> same ID, keeps its name; Hex's
+│   copy is removed only when the OS shows the chosen file is a different
+│   file (links resolved, device and inode or volume and file index); when
+│   unsure, the copy stays
+├── Hex's own copy chosen (a linked folder, a hard link, another case) ->
+│   nothing changes; the import stays a copy
+├── Card -> "Used where it is" · family · languages · the file's name; Use
+│   loads it from its path; later uses rehash only when size, mtime, or file ID
+│   change, and Check again accepts it when the contents still match
+├── Another account changes or removes the file -> Changed or Missing, as above
+└── Forget -> Hex's receipt and record only; the file stays
+```
+
+Off, the picker has no such button and Hex copies every added file as before.
+Shared folders and catalog models from a shared folder are not built.
 
 The local digest identifies the file Hex copied; it is not a publisher
 checksum. The selection, recent models, and keyboard-language mappings keep an
@@ -71,7 +117,9 @@ Picker opens, or onboarding starts -> one scan (found_models::scan)   // setup.f
 ├── A failed check or load -> "Model could not be used." with the reason; the
 │   selection and any recorded audio stay as they were
 └── Delete/Remove on a found file -> Forget: Hex's record goes, the file stays.
-    Hex never writes, moves, or deletes inside the cache
+    Hex never writes, moves, or deletes inside the cache. A forgotten catalog
+    file is noted in models/found/<model>.forgotten.json, so later scans no
+    longer count it as downloaded and its row offers Download (#1366)
 ```
 
 `hex model list` scans too and shows each model's source: `download`, `hex`,
@@ -120,8 +168,11 @@ samples. Not observed: macOS (Metal) and Windows at all, a plain-copy cache
 without symlinks, and the GPU memory warning on a small GPU.
 
 Checks: `transcription::found_models::tests` (scan, cache, catalog match,
-in-place use and forgetting, the full check refusing a mismatched file),
-`transcription::gguf_header::tests`, `transcription::custom_models::tests`,
+in-place use and forgetting, a forgotten catalog file no longer counting as
+downloaded, the full check refusing a mismatched file),
+`transcription::gguf_header::tests`, `transcription::custom_models::tests`
+(including `a_relinked_copy_reads_as_changed_and_check_again_accepts_only_the_same_contents`,
+`a_receipt_survives_a_renumbered_volume_but_not_another_file`, and `a_file_added_in_place_is_recorded_by_path_copied_nowhere_and_forgetting_leaves_it`),
 `desktop::onboarding::tests::a_held_download_waits_for_the_person`,
 `a_found_model_moves_on_without_a_download_and_back_returns_to_it`,
 `the_onboarding_model_list_starts_the_row_picked_or_the_recommended_one`,

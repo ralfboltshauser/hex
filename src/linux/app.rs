@@ -4,14 +4,15 @@
 //! closed without stopping anything.
 //!
 //! Threads: the main thread runs Rune's event loop; the host thread
-//! refreshes [`LinuxDesktopHost`] every 20 ms and publishes its status;
-//! the socket's workers answer `hex` commands from that published status
-//! and hand shortcut commands straight to the listener.
+//! refreshes [`LinuxDesktopHost`] (at once when a request changes it, else on
+//! a short idle tick) and publishes its status; the socket's workers answer
+//! `hex` commands from that published status and hand shortcut commands
+//! straight to the listener.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -31,8 +32,14 @@ use crate::linux::service::{
 };
 
 mod control;
+mod host;
 
+/// The host's refresh while it starts, stops, or prepares something.
 const REFRESH_INTERVAL: Duration = Duration::from_millis(20);
+/// How long the host waits with nothing in flight: requests and quits
+/// notify it, so only an outside settings edit or the updater waits for a
+/// tick.
+const IDLE_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 /// How often the host asks X11 for the active keyboard group.
 const INPUT_SOURCE_POLL: Duration = Duration::from_millis(250);
 /// Left by "Update" so the restarted process shows the window again; a
@@ -51,6 +58,16 @@ pub(crate) enum ShortcutTarget {
     PasteLast,
     Capture,
     RawDictation,
+    /// Labs › Transform typed text.
+    TypedText,
+    /// Labs › Terminal paste shortcut: dictates like the dictation shortcut
+    /// and always pastes with Ctrl+Shift+V.
+    TerminalPaste,
+    /// Labs › Second dictation shortcut: another key that dictates exactly
+    /// like the dictation shortcut.
+    SecondDictation,
+    /// Toggle mode's cancel shortcut.
+    Cancel,
 }
 
 struct PreparedTranscription {
@@ -139,7 +156,7 @@ struct LinuxDesktopHost {
     updater: crate::updater::Updater,
     output: crate::linux::dictation::DictationOutput,
     /// The local API's `/dictations` controls, for whichever listener runs.
-    dictations: crate::linux::dictation::DictationQueue,
+    dictations: crate::dictation::service::DictationQueue,
     /// Hosts the personal transformations workspace while a mode uses one.
     personal_commands: Option<crate::personal_commands::PersonalCommands>,
     personal_commands_checked_at: Instant,
@@ -187,6 +204,10 @@ pub(crate) enum HostRequest {
 struct Shared {
     host: Mutex<LinuxDesktopHost>,
     waker: Mutex<Option<Waker>>,
+    /// Bumped whenever something outside the host's own thread changed it,
+    /// so its next refresh is not left waiting for the idle tick.
+    refreshed: Mutex<u64>,
+    refreshed_cv: Condvar,
     /// Whether the window shows, as its app reports it.
     window_visible: Mutex<Option<WindowVisible>>,
     /// Why the window's app stopped, once it panicked (#979): the window
@@ -207,6 +228,8 @@ impl HostHandle {
         Self(Arc::new(Shared {
             host: Mutex::new(host),
             waker: Mutex::new(None),
+            refreshed: Mutex::new(0),
+            refreshed_cv: Condvar::new(),
             window_visible: Mutex::new(None),
             window_failure: Mutex::new(None),
             shutdown,
@@ -216,6 +239,7 @@ impl HostHandle {
     /// The window's "Quit Hex": drains accepted work, then exits.
     pub(crate) fn quit(&self) {
         self.0.shutdown.store(true, Ordering::Release);
+        self.notify();
     }
 
     fn lock(&self) -> MutexGuard<'_, LinuxDesktopHost> {
@@ -254,6 +278,7 @@ impl HostHandle {
             }
         };
         self.wake();
+        self.notify();
         result
     }
 
@@ -263,6 +288,7 @@ impl HostHandle {
         settings.save()?;
         self.lock().adopt_settings(settings);
         self.wake();
+        self.notify();
         Ok(())
     }
 
@@ -279,6 +305,7 @@ impl HostHandle {
     /// `hex status` asks `visible` whether the window shows.
     pub(crate) fn set_window_visible(&self, visible: WindowVisible) {
         *self.0.window_visible.lock().unwrap() = Some(visible);
+        self.notify();
     }
 
     fn window_open(&self) -> bool {
@@ -304,6 +331,7 @@ impl HostHandle {
             .window_failure
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(reason);
+        self.notify();
     }
 
     /// A closed window leaves no shortcut capture behind.
@@ -312,6 +340,8 @@ impl HostHandle {
         if host.capturing_hotkey() {
             host.cancel_shortcut_edit();
         }
+        drop(host);
+        self.notify();
     }
 
     fn wake(&self) {
@@ -319,6 +349,41 @@ impl HostHandle {
         if let Some(waker) = waker {
             waker();
         }
+    }
+
+    /// The host thread's refresh counter.
+    fn refreshed(&self) -> u64 {
+        *self
+            .0
+            .refreshed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Wakes the host thread: the state it publishes changed outside its own
+    /// refresh.
+    fn notify(&self) {
+        let mut refreshed = self
+            .0
+            .refreshed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *refreshed = refreshed.wrapping_add(1);
+        self.0.refreshed_cv.notify_all();
+    }
+
+    /// Waits for the host's next refresh, at most `timeout`, unless it was
+    /// notified since `seen`.
+    fn wait_for_refresh(&self, seen: u64, timeout: Duration) {
+        let refreshed = self
+            .0
+            .refreshed
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = self
+            .0
+            .refreshed_cv
+            .wait_timeout_while(refreshed, timeout, |refreshed| *refreshed == seen);
     }
 
     fn status(&self, snapshot: HostSnapshot, session: linux_service::Session) -> Status {
@@ -372,24 +437,31 @@ pub(crate) fn run(
         .name("hex-background-portal".into())
         .spawn(crate::linux::login_item::announce_background);
     crate::labs::log_launch();
+    // Once, at startup: a Wayland session without wl-copy can record but
+    // never copy or paste, and Settings and `hex status` repeat this warning.
+    crate::linux::paste::missing_wayland_helper().inspect(|warning| tracing::warn!("{warning}"));
     crate::audio::hex_microphone::host_service();
-    let (settings, error) = AppSettings::load_for_launch();
-    crate::linux::dictation::initialize_feedback(&settings);
+    let launch = AppSettings::load_for_launch();
+    crate::linux::dictation::initialize_feedback(&launch.settings);
     // Before any thread can load a model or the window can create its GPU.
     crate::transcription::local_transcriber::initialize_backends();
     let (control_calls, control_receiver) = mpsc::sync_channel(8);
     let (dictation_controls, dictations) = mpsc::sync_channel(8);
+    let processing = crate::dictation::modes::ProcessingState::from_settings(&launch.settings);
     let local_api = crate::local_api::LocalApi::start_for_app(
         &event_path,
         control_calls,
         Some(dictation_controls),
+        Some(crate::local_api::Processing::installed(
+            crate::local_api::processing::dictation_processor(processing.clone()),
+        )),
     );
-    let enable_on_launch = settings.enable_on_launch;
+    let enable_on_launch = launch.settings.enable_on_launch;
     let mut host = LinuxDesktopHost::new(
         event_path,
-        settings,
-        error,
+        launch,
         crate::updater::Updater::start(),
+        processing,
     );
     host.dictations = dictations.into();
     if enable_on_launch {
@@ -421,7 +493,7 @@ pub(crate) fn run(
         std::thread::Builder::new()
             .name("hex-host".into())
             .spawn(move || {
-                run_host(
+                host::run_host(
                     host,
                     published,
                     server,
@@ -435,6 +507,9 @@ pub(crate) fn run(
     let reopen = take_reopen_marker();
     let first = activation.or(reopen.then(Activation::default));
     run_window(&host, requests, first, shutdown);
+    // A window Quit ends the window before the host thread notices, so bound
+    // that wait even if the host is stuck and never arms it.
+    crate::desktop::process_exit::arm_deadline();
     shutdown.store(true, Ordering::Release);
     let _ = worker.join();
     drop(local_api);
@@ -442,61 +517,15 @@ pub(crate) fn run(
     Ok(())
 }
 
-/// The host thread: refreshes the host, publishes what the socket answers
-/// with, wakes the window on changes, and drains accepted work on quit.
-fn run_host(
-    host: HostHandle,
-    published: Arc<Published>,
-    server: linux_service::Server,
-    control: mpsc::SyncSender<Control>,
-    session: linux_service::Session,
-    tray: Option<&rune::Tray>,
-    shutdown: &'static AtomicBool,
-) {
-    let mut stopping = false;
-    let mut shown: Option<HostSnapshot> = None;
-    let mut tray_view = None;
-    let mut tray_meetings = None;
-    loop {
-        let (done, route, snapshot) = {
-            let mut guard = host.lock();
-            if shutdown.load(Ordering::Acquire) && !stopping {
-                stopping = true;
-                linux_service::notify("STOPPING=1");
-                guard.stop();
-                guard.cancel_transcription_preparation();
-                // The main thread may be waiting for the next window request.
-                let _ = control.try_send(Control::Quit);
-            }
-            guard.refresh();
-            (
-                stopping && !guard.has_pending_work(),
-                guard.shortcut_route(),
-                guard.host_snapshot(),
-            )
-        };
-        *published.shortcuts.lock().unwrap() = route;
-        *published.status.lock().unwrap() = Some(host.status(snapshot.clone(), session.clone()));
-        let meetings = crate::meeting::runtime::tray_state();
-        if shown.as_ref() != Some(&snapshot) || tray_meetings != meetings {
-            tray_meetings = meetings;
-            if let Some(tray) = tray {
-                let view = crate::linux::tray::view(&snapshot);
-                if tray_view.as_ref() != Some(&view) {
-                    crate::linux::tray::show(tray, &view);
-                    tray_view = Some(view);
-                }
-            }
-            shown = Some(snapshot);
-            host.wake();
-        }
-        if done {
-            break;
-        }
-        std::thread::sleep(REFRESH_INTERVAL);
+/// Stores `value` for readers only when it differs from what they last saw.
+/// Returns whether it was written.
+fn publish_if_changed<T: PartialEq>(slot: &Mutex<Option<T>>, value: T) -> bool {
+    let mut slot = slot.lock().unwrap_or_else(|error| error.into_inner());
+    if slot.as_ref() == Some(&value) {
+        return false;
     }
-    *published.shortcuts.lock().unwrap() = None;
-    drop(server);
+    *slot = Some(value);
+    true
 }
 
 /// The one seam between the process and its window, on the main thread
@@ -565,10 +594,13 @@ fn take_reopen_marker() -> bool {
 impl LinuxDesktopHost {
     fn new(
         event_path: PathBuf,
-        settings: AppSettings,
-        error: Option<String>,
+        launch: crate::app_settings::LaunchLoad,
         updater: crate::updater::Updater,
+        processing: crate::dictation::modes::ProcessingState,
     ) -> Self {
+        let crate::app_settings::LaunchLoad { settings, note } = launch;
+        let failed = matches!(note, Some(crate::app_settings::LaunchNote::Failed(_)));
+        let note = note.map(crate::app_settings::LaunchNote::into_message);
         let mut event_reader = EventReader::open(&event_path);
         let mut activity = DesktopActivity::default();
         activity.refresh(&mut event_reader);
@@ -580,7 +612,8 @@ impl LinuxDesktopHost {
                 .inspect_err(|error| tracing::warn!(%error, "could not open retained history"))
                 .ok()
         };
-        let output = crate::linux::dictation::DictationOutput::from_settings(&settings, history);
+        let output = crate::linux::dictation::DictationOutput::from_settings(&settings, history)
+            .sharing(processing);
         // Known before the first poll, so launching keeps the saved model
         // instead of applying the current layout's mapping.
         let keyboard_switcher = crate::transcription::keyboard_model_switching::Switcher::new(
@@ -601,8 +634,10 @@ impl LinuxDesktopHost {
             error: None,
             dismissed_failure_at: None,
             gnome_shortcuts: None,
-            settings_valid: error.is_none(),
-            settings_error: error,
+            // A file that isn't a JSON object starts with defaults and says
+            // so, but still dictates; only a failed load blocks recording.
+            settings_valid: !failed,
+            settings_error: note,
             settings,
             shortcut_edit: None,
             prepared_transcriber: None,
@@ -610,7 +645,7 @@ impl LinuxDesktopHost {
             transcription_error: None,
             updater,
             output,
-            dictations: crate::linux::dictation::DictationQueue::default(),
+            dictations: crate::dictation::service::DictationQueue::default(),
             personal_commands: None,
             personal_commands_checked_at: Instant::now(),
             settings_modified: settings_modified(),
@@ -655,12 +690,25 @@ impl LinuxDesktopHost {
             return;
         }
         self.settings_modified = modified;
-        match AppSettings::load() {
-            Ok(settings) if settings != self.settings => {
-                tracing::info!("settings.json changed outside Hex; applying it");
+        let Ok(path) = crate::app_settings::path() else {
+            return;
+        };
+        // The poll runs only on an mtime change, so a broken file is reported
+        // once per edit instead of every two seconds. Its defaults are never
+        // adopted; a later valid or removed file is.
+        match AppSettings::load_checked_from(&path) {
+            Ok((_, Some(issue))) => {
+                self.settings_error = Some(issue.reload_error());
+            }
+            Ok((settings, None)) => {
+                // Adopting a fixed or removed file also clears this process's
+                // stale-defaults refusal; nowhere else does.
+                AppSettings::forget_unparseable(&path);
+                if settings != self.settings {
+                    tracing::info!("settings.json changed outside Hex; applying it");
+                }
                 self.adopt_settings(settings);
             }
-            Ok(_) => {}
             Err(error) => tracing::warn!(error = format!("{error:#}"), "could not reload settings"),
         }
     }
@@ -770,12 +818,7 @@ impl LinuxDesktopHost {
         let Some(wanted) = crate::linux::gnome_shortcuts::wanted(requested, shortcuts) else {
             return;
         };
-        let key = format!(
-            "{wanted} {:?} {:?} {:?}",
-            self.settings.dictation_hotkey,
-            self.settings.paste_last_hotkey,
-            capture_shortcut(&self.settings)
-        );
+        let key = gnome_shortcuts_key(&self.settings, wanted);
         if self.gnome_shortcuts.as_deref() == Some(key.as_str()) {
             return;
         }
@@ -965,6 +1008,9 @@ impl LinuxDesktopHost {
     /// Adopts settings the window saved. A running listener applies them in
     /// place, so listening never stops for a settings change.
     fn adopt_settings(&mut self, settings: AppSettings) {
+        // A valid file clears the parse error even when it loads the settings
+        // already running (a fixed file equal to what Hex had in memory).
+        self.settings_error = None;
         if self.settings_valid && settings == self.settings {
             return;
         }
@@ -977,7 +1023,6 @@ impl LinuxDesktopHost {
         let was_valid = self.settings_valid;
         self.settings = settings;
         self.settings_valid = true;
-        self.settings_error = None;
         self.apply_output_settings();
         if let Some(listener) = &self.listener {
             listener.update(ListenerUpdate::Settings(Box::new(self.settings.clone())));
@@ -1037,17 +1082,23 @@ impl LinuxDesktopHost {
             let canceled = edit.canceled.clone();
             edit.worker = Some(std::thread::spawn(move || {
                 binding.validate()?;
-                if crate::linux::session::LinuxSession::detect().is_wayland() {
-                    // The listener asks the desktop again and reports what it granted.
-                    binding.portal_trigger()?;
-                } else {
-                    // Fail before saving when another X11 client holds the chord.
-                    crate::linux::input::LinuxHotkeyMonitor::start(
-                        binding.clone(),
-                        Default::default(),
-                        Default::default(),
-                        mpsc::channel().1.into(),
-                    )?;
+                match target {
+                    // The cancel key is grabbed only while a recording runs,
+                    // and never through the portal: nothing to try now.
+                    ShortcutTarget::Cancel => {}
+                    _ if crate::linux::session::LinuxSession::detect().is_wayland() => {
+                        // The listener asks the desktop again and reports what it granted.
+                        binding.portal_trigger()?;
+                    }
+                    _ => {
+                        // Fail before saving when another X11 client holds the chord.
+                        crate::linux::input::LinuxHotkeyMonitor::start(
+                            binding.clone(),
+                            Default::default(),
+                            Default::default(),
+                            mpsc::channel().1.into(),
+                        )?;
+                    }
                 }
                 if canceled.load(Ordering::Acquire) {
                     return Err(color_eyre::eyre::eyre!("Shortcut edit canceled"));
@@ -1061,6 +1112,14 @@ impl LinuxDesktopHost {
                         ShortcutTarget::RawDictation => {
                             settings.raw_dictation_hotkey = Some(binding)
                         }
+                        ShortcutTarget::TypedText => settings.typed_text_hotkey = Some(binding),
+                        ShortcutTarget::TerminalPaste => {
+                            settings.terminal_paste_hotkey = Some(binding)
+                        }
+                        ShortcutTarget::SecondDictation => {
+                            settings.second_dictation_hotkey = Some(binding)
+                        }
+                        ShortcutTarget::Cancel => settings.cancel_hotkey = binding,
                     }
                 })
             }));
@@ -1244,6 +1303,19 @@ fn capture_shortcut(settings: &AppSettings) -> Option<&crate::app_settings::Hotk
     None
 }
 
+/// What the GNOME custom shortcuts were last synced for: a new key means an
+/// entry was added, removed, or rebound. Typed text is included while its
+/// lab is on and its shortcut is bound, so toggling either resyncs.
+fn gnome_shortcuts_key(settings: &AppSettings, wanted: bool) -> String {
+    format!(
+        "{wanted} {:?} {:?} {:?} {:?}",
+        settings.dictation_hotkey,
+        settings.paste_last_hotkey,
+        capture_shortcut(settings),
+        settings.active_typed_text_hotkey()
+    )
+}
+
 fn settings_modified() -> Option<std::time::SystemTime> {
     let path = crate::app_settings::path().ok()?;
     std::fs::metadata(path)
@@ -1294,8 +1366,11 @@ impl LinuxDesktopHost {
             activity: self.activity.clone(),
             listener: DesktopListenerSnapshot {
                 running: self.is_running(),
+                warming: self.listener.as_ref().is_some_and(|listener| {
+                    matches!(listener.startup, ListenerStartup::Awaiting { .. })
+                }),
                 status: self.status.clone(),
-                warning: None,
+                notice: crate::linux::paste::listener_warning(self.is_running()),
                 shortcuts: self
                     .listener
                     .as_ref()
@@ -1305,6 +1380,7 @@ impl LinuxDesktopHost {
                     .listener
                     .as_ref()
                     .is_some_and(|listener| listener.hotkey_status.configurable()),
+                ..DesktopListenerSnapshot::default()
             },
             operation_error: self
                 .error
@@ -1405,6 +1481,16 @@ mod tests {
         ModelPreparationStage, TranscriptionModelId, TranscriptionSelection,
     };
 
+    fn test_host(launch: crate::app_settings::LaunchLoad) -> LinuxDesktopHost {
+        let processing = crate::dictation::modes::ProcessingState::from_settings(&launch.settings);
+        LinuxDesktopHost::new(
+            PathBuf::new(),
+            launch,
+            crate::updater::Updater::idle(),
+            processing,
+        )
+    }
+
     fn host_for_edit(running: bool) -> LinuxDesktopHost {
         let settings = AppSettings {
             transcription: TranscriptionSelection {
@@ -1414,12 +1500,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut host = LinuxDesktopHost::new(
-            PathBuf::new(),
+        let mut host = test_host(crate::app_settings::LaunchLoad {
             settings,
-            None,
-            crate::updater::Updater::idle(),
-        );
+            note: None,
+        });
         if running {
             host.listener = Some(Listener {
                 worker: std::thread::spawn(|| Ok(())),
@@ -1461,14 +1545,104 @@ mod tests {
     }
 
     #[test]
+    fn a_notification_wakes_the_idle_host_before_its_tick() {
+        static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+        let host = HostHandle::new(host_for_edit(false), &SHUTDOWN);
+        let seen = host.refreshed();
+        let waiter = host.clone();
+        let started = Instant::now();
+        let waiting = std::thread::spawn(move || {
+            waiter.wait_for_refresh(seen, Duration::from_secs(5));
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        host.notify();
+        assert!(waiting.join().unwrap() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn unchanged_status_is_not_published_again() {
+        let published = Mutex::new(None);
+        assert!(publish_if_changed(&published, 1));
+        assert!(!publish_if_changed(&published, 1));
+        assert!(publish_if_changed(&published, 2));
+        assert_eq!(*published.lock().unwrap(), Some(2));
+    }
+
+    /// The GNOME sync cache key must move when the typed-text lab or its
+    /// binding changes, or stale `hex-typed-text` entries stay behind.
+    #[test]
+    fn the_gnome_shortcut_key_tracks_typed_text() {
+        use crate::app_settings::{HotkeyKey, HotkeyModifiers};
+
+        let binding = HotkeyBinding {
+            modifiers: HotkeyModifiers::control_option(),
+            key: Some(HotkeyKey::named("t")),
+        };
+        let mut settings = AppSettings {
+            typed_text_hotkey: Some(binding.clone()),
+            ..AppSettings::default()
+        };
+        let lab_off = gnome_shortcuts_key(&settings, true);
+
+        settings.labs.typed_text = true;
+        let bound = gnome_shortcuts_key(&settings, true);
+        assert_ne!(lab_off, bound, "turning the lab on adds an entry");
+
+        settings.typed_text_hotkey = Some(HotkeyBinding {
+            modifiers: HotkeyModifiers::control(),
+            ..binding
+        });
+        let rebound = gnome_shortcuts_key(&settings, true);
+        assert_ne!(bound, rebound, "changing the binding rewrites it");
+
+        settings.typed_text_hotkey = None;
+        let unbound = gnome_shortcuts_key(&settings, true);
+        assert_ne!(rebound, unbound, "unbinding removes it");
+        assert_eq!(
+            lab_off, unbound,
+            "no bound typed-text shortcut means no entry either way"
+        );
+
+        settings.labs.typed_text = false;
+        assert_eq!(
+            gnome_shortcuts_key(&settings, true),
+            lab_off,
+            "turning the lab off returns to the lab-off key"
+        );
+    }
+
+    #[test]
+    fn a_settings_parse_note_does_not_block_capture() {
+        let mut host = test_host(
+            // A model never installed on Linux keeps `start` from opening a
+            // real microphone while still proving the validity gate passed.
+            crate::app_settings::LaunchLoad {
+                settings: host_for_edit(false).settings.clone(),
+                note: Some(crate::app_settings::LaunchNote::Unparseable(
+                    "Hex couldn't read settings.json and started with defaults.".into(),
+                )),
+            },
+        );
+        assert!(host.settings_valid);
+        assert!(host.settings_error.is_some());
+        host.start();
+        assert!(host.listen_when_ready);
+        assert_eq!(host.status, "Model required");
+        assert!(!host.is_running());
+    }
+
+    #[test]
     fn malformed_settings_cannot_start_even_after_dismissing_the_error() {
-        let mut host = LinuxDesktopHost::new(
-            PathBuf::new(),
+        let mut host = test_host(
             // A model never installed on Linux, so the resumed start below
             // cannot open the microphone where the real model is installed.
-            host_for_edit(false).settings.clone(),
-            Some("Could not load Linux settings: invalid JSON".into()),
-            crate::updater::Updater::idle(),
+            crate::app_settings::LaunchLoad {
+                settings: host_for_edit(false).settings.clone(),
+                note: Some(crate::app_settings::LaunchNote::Failed(
+                    "Could not load Linux settings: invalid JSON".into(),
+                )),
+            },
         );
         host.start();
         assert!(!host.is_running());
@@ -1509,6 +1683,18 @@ mod tests {
             assert!(listener.stop.load(Ordering::Relaxed));
             listener.finish().unwrap();
         }
+    }
+
+    #[test]
+    fn a_listener_still_starting_is_warming_until_its_session_begins() {
+        let mut host = host_for_edit(true);
+        assert!(!host.snapshot().listener.warming);
+        host.listener.as_mut().unwrap().startup = ListenerStartup::Awaiting {
+            previous_session: None,
+        };
+        assert!(host.snapshot().listener.warming);
+        host.listener.as_mut().unwrap().startup = ListenerStartup::Observed;
+        assert!(!host.snapshot().listener.warming);
     }
 
     #[test]
@@ -1808,12 +1994,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut host = LinuxDesktopHost::new(
-            PathBuf::new(),
+        let mut host = test_host(crate::app_settings::LaunchLoad {
             settings,
-            None,
-            crate::updater::Updater::idle(),
-        );
+            note: None,
+        });
         host.transcription_preparation = Some(TranscriptionPreparation {
             canceled: Arc::new(AtomicBool::new(false)),
             model: TranscriptionModelId::default(),

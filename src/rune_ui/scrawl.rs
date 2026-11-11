@@ -8,7 +8,7 @@ use scrawl_capture::retention::{Policy, Preset};
 
 use super::controls::{
     ButtonKind, Choice, Paint, button, card, described_row, folding, note, page, section,
-    segmented, select, setting_row, toggle_row,
+    segmented, select, setting_row, step_row, toggle_row,
 };
 use super::general::keys_button;
 use super::lists::permission_control;
@@ -30,12 +30,21 @@ fn description(enabled: bool) -> &'static str {
 /// Turns Annotate on or off; turning it on fails while its shortcut
 /// collides with another, and leaves the shortcuts as they are.
 fn set_enabled(settings: &mut AppSettings, enabled: bool) -> Result<(), &'static str> {
-    if enabled
-        && super::settings::conflicts(settings, ShortcutTarget::Capture, &settings.capture.hotkey)
-    {
-        return Err(tr(
-            "The capture shortcut is already in use. Change it below before turning captures on.",
-        ));
+    if enabled {
+        // Judged as it will be, not as it is: a shortcut the capture
+        // shortcuts only reserve while Annotate is on (the Screenshots
+        // record shortcut among them) must still count.
+        let mut candidate = settings.clone();
+        candidate.capture.enabled = true;
+        if super::settings::conflicts(
+            &candidate,
+            ShortcutTarget::Capture,
+            &candidate.capture.hotkey,
+        ) {
+            return Err(tr(
+                "The capture shortcut is already in use. Change it below before turning captures on.",
+            ));
+        }
     }
     settings.capture.enabled = enabled;
     Ok(())
@@ -100,7 +109,7 @@ fn retention_description(policy: Policy) -> String {
 /// The captures folder, with the home folder as `~`.
 fn folder_label(ui: &Ui) -> String {
     let folder = ui.settings.capture.captures_dir();
-    dirs::home_dir()
+    crate::app_paths::home_dir()
         .and_then(|home| {
             folder
                 .strip_prefix(home)
@@ -110,11 +119,12 @@ fn folder_label(ui: &Ui) -> String {
         .unwrap_or_else(|| folder.display().to_string())
 }
 
-/// The steps, each with its keys: one key taps to start and stop and is
-/// held to draw; the capsule's pen draws without it; Esc stops drawing.
+/// The steps in order, each with its keys where it has any: one key taps
+/// to start and stop and is held to draw; the capsule's pen draws without
+/// it; Esc stops drawing.
 fn how_it_works(ui: &Ui, p: Paint) -> Vec<El> {
     let shortcut = ui.settings.capture.hotkey.keycaps();
-    let keys = |key: &str, parts: &[String]| super::controls::keycaps(p, key, parts);
+    let keys = |key: &str, parts: &[String]| Some(super::controls::keycaps(p, key, parts));
     // Wayland tells Hex nothing of Shift outside its own windows.
     let draw_how = if cfg!(not(target_os = "linux")) {
         tr(
@@ -124,46 +134,47 @@ fn how_it_works(ui: &Ui, p: Paint) -> Vec<El> {
         tr("While it records, hold the shortcut and move the pointer; no click needed")
     };
     vec![
-        setting_row(
+        step_row(
             p,
             "how-start",
+            1,
             tr("Start"),
-            Some(tr("Tap the shortcut to start recording; talk as you go")),
             keys("how-start-keys", &shortcut),
+            tr("Tap the shortcut to start recording; talk as you go"),
         ),
-        setting_row(
+        step_row(
             p,
             "how-draw",
+            2,
             tr("Draw"),
-            Some(draw_how),
             keys("how-draw-keys", &shortcut),
+            draw_how,
         ),
-        setting_row(
+        step_row(
             p,
             "how-pen",
+            3,
             tr("Pen"),
-            Some(tr(
-                "Or click the pen on the bar, then drag to draw; click it again or press Esc to stop",
-            )),
             keys("how-pen-keys", &["Esc".to_string()]),
+            tr(
+                "Or click the pen on the bar, then drag to draw; click it again or press Esc to stop",
+            ),
         ),
-        setting_row(
+        step_row(
             p,
             "how-stop",
+            4,
             tr("Stop"),
-            Some(tr(
-                "Tap the shortcut again: the annotation is copied, ready to paste",
-            )),
             keys("how-stop-keys", &shortcut),
+            tr("Tap the shortcut again: the annotation is copied, ready to paste"),
         ),
-        setting_row(
+        step_row(
             p,
             "how-send",
+            5,
             tr("Send"),
-            Some(tr(
-                "Paste it anywhere, or click Send to… on the capsule to pick a session",
-            )),
-            rune::el(),
+            None,
+            tr("Paste it anywhere, or click Send to… on the capsule to pick a session"),
         ),
     ]
 }
@@ -213,6 +224,37 @@ fn shortcut_rows(ui: &Ui, p: Paint, view: &ScrawlView) -> Vec<El> {
         Some((purpose.to_string(), p.muted())),
         keys_button(ui, p, ShortcutTarget::Capture),
     )];
+    #[cfg(target_os = "macos")]
+    if crate::labs::Feature::AnnotateReplay.on_this_os()
+        && crate::labs::Feature::AnnotateReplay.on(&ui.settings)
+    {
+        let mut control = row()
+            .key("capture-replay-shortcut-control")
+            .gap(4.0)
+            .center_y()
+            .child(keys_button(ui, p, ShortcutTarget::CaptureReplay));
+        if ui.settings.capture.replay_hotkey.is_some() {
+            control = control.child(super::controls::icon_button(
+                p,
+                "clear-capture-replay-shortcut",
+                &rune_theme_opencode::icons::TRASH,
+                tr("Clear shortcut"),
+                |ui: &mut Ui| {
+                    ui.update(|settings| settings.capture.replay_hotkey = None);
+                },
+            ));
+        }
+        rows.push(described_row(
+            p,
+            "capture-replay-shortcut",
+            tr("Replay last 15 s"),
+            Some((
+                tr("Press to save the last 15 s; hold to narrate over it").to_string(),
+                p.muted(),
+            )),
+            control,
+        ));
+    }
     // Linux asks through the desktop's screen-cast portal when a capture
     // starts, and Wayland can't keep an overlay out of a recording.
     if enabled && cfg!(target_os = "macos") && view.screen_needs_restart {
@@ -364,6 +406,7 @@ fn storage_rows(ui: &Ui, p: Paint, view: &ScrawlView, layer: &mut Vec<El>) -> Ve
             select(
                 p,
                 "capture-retention-menu",
+                tr("Keep"),
                 &retention_label(policy),
                 ui.open == Some(Menu::CaptureRetention),
                 choices,
@@ -443,7 +486,7 @@ pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
             storage_rows(ui, p, &view, layer),
         ));
     }
-    super::scroll_body("scroll", content)
+    super::scroll_body(p.k, "scroll", content)
 }
 
 #[cfg(test)]
@@ -466,6 +509,47 @@ mod tests {
         assert_eq!(serde_json::to_value(&taken).unwrap(), before);
         // Turning captures off always works.
         set_enabled(&mut taken, false).unwrap();
+    }
+
+    /// A record shortcut saved while Annotate was off holds its key: giving
+    /// Annotate the same chord and turning it on is refused, since the
+    /// Screenshots record shortcut would otherwise go dead and Annotate's
+    /// whole-screen recording would take the chord.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn annotate_will_not_take_a_saved_record_shortcut() {
+        let record = crate::app_settings::HotkeyBinding {
+            modifiers: crate::app_settings::HotkeyModifiers {
+                command: Some(crate::app_settings::ModifierSide::Either),
+                shift: Some(crate::app_settings::ModifierSide::Either),
+                ..Default::default()
+            },
+            key: Some(crate::app_settings::HotkeyKey::named("r")),
+        };
+        let mut settings = AppSettings::default();
+        settings.capture.enabled = false;
+        settings.labs.screenshots = true;
+        settings.screenshots.record_hotkey = Some(record.clone());
+        settings.capture.hotkey = record;
+        let before = serde_json::to_value(&settings).unwrap();
+        assert!(
+            set_enabled(&mut settings, true)
+                .unwrap_err()
+                .contains("already in use")
+        );
+        assert_eq!(serde_json::to_value(&settings).unwrap(), before);
+
+        // With the Lab off, the saved record shortcut still holds the key:
+        // Annotate can't take it until the record shortcut is cleared.
+        settings.labs.screenshots = false;
+        assert!(
+            set_enabled(&mut settings, true)
+                .unwrap_err()
+                .contains("already in use")
+        );
+        settings.screenshots.record_hotkey = None;
+        set_enabled(&mut settings, true).unwrap();
+        assert!(settings.capture.enabled);
     }
 
     /// The Scrawl pane drawn from `scene`, laid out headlessly.

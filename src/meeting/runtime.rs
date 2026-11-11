@@ -74,6 +74,11 @@ impl Meetings {
             .spawn(move || {
                 for event in events {
                     capsules.event(&event);
+                    #[cfg(target_os = "linux")]
+                    if matches!(event, ControllerEvent::Offer(_)) {
+                        let window = window.clone();
+                        capsules.when_offer_unshown(move |reason| offer_unshown(&window, reason));
+                    }
                     follow(&event, &window);
                 }
             })?;
@@ -134,6 +139,26 @@ pub(crate) fn copy_last_transcript() -> Result<(), String> {
     Ok(())
 }
 
+/// The offer capsule could not open (GNOME on Wayland, #1271): the
+/// Meetings pane says so and its Record starts the recording instead.
+#[cfg(target_os = "linux")]
+fn offer_unshown(window: &rune::AppHandle<Ui>, reason: String) {
+    tracing::warn!(%reason, "meeting recording offer could not show; opening the Meetings pane");
+    let mut message = format!(
+        "Hex detected a call but couldn't show its recording offer on this desktop ({reason}). Record it from here."
+    );
+    if !crate::labs::gnome_meeting_capsules() {
+        message.push_str(
+            " On GNOME, Labs › Floating meeting capsules on GNOME can show it over your call.",
+        );
+    }
+    window.update(move |ui, tx| {
+        crate::rune_ui::meeting_failed(ui, message);
+        crate::rune_ui::show(ui, Destination::Meetings(None), tx);
+    });
+    window.open();
+}
+
 /// Mirrors an event into the recording state and the window.
 fn follow(event: &ControllerEvent, window: &rune::AppHandle<Ui>) {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
@@ -145,8 +170,10 @@ fn follow(event: &ControllerEvent, window: &rune::AppHandle<Ui>) {
                 id: id.clone(),
                 title: title.clone(),
                 chapters: Vec::new(),
+                warning: None,
             };
         }
+        ControllerEvent::SourceWarning { warning } => state.source_warning(*warning),
         ControllerEvent::Retitled { title } => {
             if let MeetingMenuState::Recording { title: shown, .. } = &mut *state {
                 shown.clone_from(title);
@@ -178,6 +205,15 @@ fn follow(event: &ControllerEvent, window: &rune::AppHandle<Ui>) {
             let message = format!("{title}: {error}");
             window.update(move |ui, tx| {
                 crate::rune_ui::meeting_failed(ui, message);
+                crate::rune_ui::show(ui, Destination::Meetings(None), tx);
+            });
+            window.open();
+        }
+        ControllerEvent::ImportFailed { error } => {
+            tracing::error!(%error, "meeting audio import failed");
+            let message = error.clone();
+            window.update(move |ui, tx| {
+                crate::rune_ui::meeting_import_failed(ui, message);
                 crate::rune_ui::show(ui, Destination::Meetings(None), tx);
             });
             window.open();

@@ -28,18 +28,28 @@ pub(super) enum Tone {
     Neutral,
     Accent,
     Success,
+    Warning,
     Danger,
+}
+
+impl Tone {
+    /// The tinted fill, border, and ink this tone paints.
+    fn colors(self, p: Paint) -> (Color, Color, Color) {
+        let c = &p.k.c;
+        let state = match self {
+            Self::Neutral => return (c.layer_02, c.border_base, c.text_muted),
+            Self::Accent => &c.info,
+            Self::Success => &c.success,
+            Self::Warning => &c.warning,
+            Self::Danger => &c.danger,
+        };
+        (state.bg, state.border, state.fg)
+    }
 }
 
 /// A small tinted status label, never pressable.
 pub(super) fn tone_tag(p: Paint, key: &str, label: &str, tone: Tone) -> El {
-    let c = &p.k.c;
-    let (fill, border, ink) = match tone {
-        Tone::Neutral => (c.layer_02, c.border_base, c.text_muted),
-        Tone::Accent => (c.info.bg, c.info.border, c.info.fg),
-        Tone::Success => (c.success.bg, c.success.border, c.success.fg),
-        Tone::Danger => (c.danger.bg, c.danger.border, c.danger.fg),
-    };
+    let (fill, border, ink) = tone.colors(p);
     row()
         .key(key)
         .role("status")
@@ -63,6 +73,8 @@ pub(super) fn tone_tag(p: Paint, key: &str, label: &str, tone: Tone) -> El {
 pub(super) fn group_label(p: Paint, key: &str, label: &str, first: bool) -> El {
     text(label)
         .key(key)
+        .role("heading")
+        .level(3)
         .font(p.k.ty.small_medium)
         .color(p.faint())
         .px(10.0)
@@ -122,10 +134,13 @@ pub(super) fn list_row(
     select: impl Fn(&mut Ui) + 'static,
 ) -> El {
     let c = &p.k.c;
+    // Named by its title and described by its meta line; the texts that
+    // show them stay out of the tree.
     let mut item = col()
         .key(key)
-        .role("button")
+        .role("listitem")
         .label(title)
+        .description(meta)
         .px(LIST_ROW_PX)
         .py(8.0)
         .gap(2.0)
@@ -143,7 +158,8 @@ pub(super) fn list_row(
                         .color(p.text())
                         .grow(1.0)
                         .shrink()
-                        .truncate(),
+                        .truncate()
+                        .a11y_hidden(),
                 )
                 .children(trailing),
         )
@@ -152,7 +168,8 @@ pub(super) fn list_row(
                 .key("meta")
                 .font(p.k.ty.small)
                 .color(p.muted())
-                .truncate(),
+                .truncate()
+                .a11y_hidden(),
         );
     if selected {
         item = item.fill(c.layer_02);
@@ -183,18 +200,18 @@ pub(super) fn message(p: Paint, key: &str, title: &str, detail: Option<&str>) ->
         }))
 }
 
-/// An error title and its detail, as a tinted panel.
-pub(super) fn error_panel(p: Paint, key: &str, title: &str, detail: &str) -> El {
-    let d = &p.k.c.danger;
+/// An error or warning title and its detail, as a tinted panel.
+pub(super) fn error_panel(p: Paint, key: &str, title: &str, detail: &str, tone: Tone) -> El {
+    let (fill, border, ink) = tone.colors(p);
     col()
         .key(key)
         .px(12.0)
         .py(10.0)
         .gap(2.0)
         .radius(p.k.radius.md)
-        .fill(d.bg)
-        .border(0.5, d.border)
-        .child(text(title).key("title").font(p.k.ty.ui_medium).color(d.fg))
+        .fill(fill)
+        .border(0.5, border)
+        .child(text(title).key("title").font(p.k.ty.ui_medium).color(ink))
         .child(
             text(detail)
                 .key("detail")
@@ -264,7 +281,13 @@ pub(super) fn split(p: Paint, key: &str, list: El, detail: El) -> El {
                 .pr(8.0)
                 .child(list),
         )
-        .child(el().key("rule").w(p.hair).h_full().fill(p.k.c.border_weak))
+        .child(
+            el().key("rule")
+                .w(p.hair)
+                .h_full()
+                .fill(p.k.c.border_weak)
+                .a11y_hidden(),
+        )
         .child(detail)
 }
 
@@ -433,7 +456,7 @@ pub(super) fn permission_control(
         .gap(gap)
         .center_y()
         .motion(GATHER)
-        .children(mark)
+        .children(mark.map(El::a11y_hidden))
         .child(pill.motion(GATHER));
     if control == PermissionControl::Allowed {
         control_row.sequence(Sequence::new(grant_beats()))
@@ -525,8 +548,10 @@ fn allowed_pill(p: Paint, key: &str, kind: ButtonKind) -> El {
     let font = k.ty.ui_medium;
     let ink = p.success();
     let (allow, allowed) = (tr("Allow"), tr("Allowed"));
+    // Announced as the grant lands; the label says what its texts show.
     let mut pill = row()
         .key(key)
+        .role("status")
         .label(allowed)
         .h(28.0)
         .pl(PILL_PADDING)
@@ -548,17 +573,31 @@ fn allowed_pill(p: Paint, key: &str, kind: ButtonKind) -> El {
     {
         // "Allow" stays and "ed" wipes in after it.
         Some(suffix) => pill
-            .child(text(allow).key("label").font(font).color(ink).motion(INK))
+            .child(
+                text(allow)
+                    .key("label")
+                    .font(font)
+                    .color(ink)
+                    .motion(INK)
+                    .a11y_hidden(),
+            )
             .child(
                 text(suffix)
                     .key("suffix")
                     .font(font)
                     .color(ink)
                     .transition(wipe(SUFFIX, 2.0))
-                    .sequence(Sequence::new(APPEAR)),
+                    .sequence(Sequence::new(APPEAR))
+                    .a11y_hidden(),
             ),
         // Languages whose word changes cross-fade it.
-        None => pill.child(text(allowed).key("allowed").font(font).color(ink)),
+        None => pill.child(
+            text(allowed)
+                .key("allowed")
+                .font(font)
+                .color(ink)
+                .a11y_hidden(),
+        ),
     }
 }
 
@@ -571,7 +610,8 @@ pub(super) fn allowed(p: Paint, key: &str, label: &str) -> El {
         .child(
             rune::icon(p.k.glyph.check_small, 16.0)
                 .key("check")
-                .color(p.success()),
+                .color(p.success())
+                .a11y_hidden(),
         )
         .child(
             text(label)
@@ -643,6 +683,8 @@ pub(super) fn slider_in<S: 'static>(
         .key("track")
         .role("slider")
         .label(label)
+        .range_value(f64::from(value), 0.0, 1.0)
+        .a11y_value(display.clone())
         .w(width)
         .h(22.0)
         .center_y()
@@ -670,7 +712,8 @@ pub(super) fn slider_in<S: 'static>(
                         .h(4.0)
                         .radius(2.0)
                         .fill(c.icon_accent),
-                ),
+                )
+                .a11y_hidden(),
         )
         .child(
             el().key("knob")
@@ -678,7 +721,8 @@ pub(super) fn slider_in<S: 'static>(
                 .size(knob, knob)
                 .radius(knob / 2.0)
                 .fill(c.knob)
-                .border(p.hair.max(0.5), c.border_strong),
+                .border(p.hair.max(0.5), c.border_strong)
+                .a11y_hidden(),
         );
     col()
         .key(key)
@@ -694,7 +738,9 @@ pub(super) fn slider_in<S: 'static>(
                         .key("value")
                         .font(p.k.ty.mono)
                         .color(p.faint()),
-                ),
+                )
+                // The slider reads its name and value.
+                .a11y_hidden(),
         )
         .child(track)
 }

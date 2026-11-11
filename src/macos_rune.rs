@@ -3,8 +3,11 @@
 //! - The main thread runs Rune's event loop (`rune::App`, windowless and
 //!   kept running, as an accessory app) and, beside it on the same AppKit
 //!   run loop, the native status item, the updater, the main menu, the Dock
-//!   reopen handler, and the Metal dictation HUD. A 16 ms main-loop timer
-//!   ([`Pump`]) drives them, so they keep working with no window open.
+//!   reopen handler, and the Metal dictation HUD. A main-loop timer
+//!   ([`Pump`]) drives them, so they keep working with no window open: every
+//!   frame (16 ms) while the HUD animates, otherwise every 250 ms, and
+//!   whatever sends it work (HUD events, menu actions, control calls,
+//!   meeting events, input-source changes) wakes it at once ([`wake_pump`]).
 //! - The runtime thread owns model preparation, starts the listener once
 //!   setup is ready, and publishes the listener, model, update, and settings
 //!   state the window shows ([`RuntimeHandle`]).
@@ -34,15 +37,14 @@ use block2::RcBlock;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, Sel};
+use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{MainThreadOnly, msg_send, sel};
-use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::{MainThreadMarker, NSAppleEventManager, NSObject, NSString, NSTimer};
 
 use crate::app_settings::AppSettings;
 use crate::desktop::host::{
-    DesktopAction, DesktopListenerSnapshot, DesktopShortcut, DesktopShortcuts,
-    DesktopTranscriptionSnapshot, DesktopUpdateStatus,
+    DesktopAction, DesktopListenerSnapshot, DesktopTranscriptionSnapshot, DesktopUpdateStatus,
 };
 use crate::dictation::indicator::DictationIndicatorEvent;
 use crate::macos_rune::status_item::StatusItemAction;
@@ -51,21 +53,33 @@ use crate::meeting::watcher::{ControllerEvent, ListenerConfig, MeetingMenuState}
 use crate::recognition::RecognitionControl;
 use crate::rune_hud::DictationIndicatorUi;
 use crate::rune_ui::{Destination, Ui};
-use crate::transcription::models::{
-    ModelPreparationStage, TranscriptionModelId, TranscriptionSelection,
-};
-use crate::transcription::preparation::TranscriptionPreparation;
 
+mod activation;
 mod control;
+mod launch;
+mod main_menu;
+mod request;
+mod runtime;
 pub(crate) mod status_item;
+mod wake;
+
+use activation::{observe_activation, reopen_on_activation};
+use launch::{LaunchWindow, launched_as_login_item, observe_launch, take_login_launch_activation};
+use main_menu::install_main_menu;
+use runtime::run_runtime;
+use wake::{pump_now, relay, start_pump_timer};
+
+pub(crate) use request::{Request, ShortcutTarget};
+pub(crate) use wake::wake_pump;
+
+#[cfg(test)]
+use wake::pump_interval;
 
 #[cfg(test)]
 mod tests;
 
 /// How often the runtime refreshes while nothing is asked.
 const RUNTIME_TICK: Duration = Duration::from_millis(250);
-/// The main-loop timer: the HUD follows the pointer and channels drain.
-const PUMP_INTERVAL: f64 = 0.016;
 /// Seconds a window opened at launch has to draw its first frame before the
 /// status item, HUD, and menu are set up anyway.
 const LAUNCH_SETUP_DEADLINE: f64 = 1.0;
@@ -75,50 +89,6 @@ const MEETING_MENU_REFRESH: Duration = Duration::from_millis(500);
 /// opened again while it runs (Dock, Finder, `open`).
 const CORE_EVENT_CLASS: u32 = u32::from_be_bytes(*b"aevt");
 const REOPEN_APPLICATION: u32 = u32::from_be_bytes(*b"rapp");
-
-/// What the window asks the runtime, in the Linux service's vocabulary so
-/// the shared panes send the same requests on every platform.
-#[derive(Clone, Debug)]
-pub(crate) enum Request {
-    /// Update actions go to the updater from the window (`rune_ui::host`).
-    Desktop(#[allow(dead_code)] DesktopAction),
-    /// Handled in the window (`rune_ui::host`): an AppKit event monitor.
-    CaptureShortcutFor(#[allow(dead_code)] ShortcutTarget),
-    CancelShortcut,
-    /// Linux's service registers recorded shortcuts; on macOS the window
-    /// saves them and the listener follows `settings.json`.
-    #[allow(dead_code)]
-    SetShortcut {
-        target: ShortcutTarget,
-        shortcut: DesktopShortcut,
-    },
-    ChooseModel {
-        model: TranscriptionModelId,
-        language: String,
-    },
-    /// The menu bar's model list: only installed models, never a download.
-    SelectInstalledModel(TranscriptionModelId),
-    /// `hex model use`: this exact selection, installed only, never a download.
-    UseInstalledSelection(TranscriptionSelection),
-    /// Snapshot from the main-thread TIS observer, not a shortcut event.
-    InputSourceChanged(Option<String>),
-    CancelModel,
-    /// The window saved `settings.json`; adopt it.
-    ReloadSettings,
-}
-
-/// A shortcut the listener registers.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ShortcutTarget {
-    #[default]
-    Dictation,
-    PasteLast,
-    #[cfg(hex_capture)]
-    Capture,
-    RawDictation,
-    /// Labs › Second dictation shortcut.
-    SecondDictation,
-}
 
 /// What the runtime last published for the window and the menu bar.
 #[derive(Clone, PartialEq)]
@@ -137,6 +107,17 @@ type Wake = Arc<dyn Fn() + Send + Sync>;
 struct Shared {
     published: Mutex<Option<Arc<Published>>>,
     wakers: Mutex<Vec<Wake>>,
+    /// The listener's event log, which the runtime reads and the tour shares.
+    event_path: PathBuf,
+    /// When this run began, in the event log's wall-clock ms, captured before
+    /// the listener thread starts.
+    started_at: u64,
+}
+
+impl Shared {
+    fn event_path(&self) -> &Path {
+        &self.event_path
+    }
 }
 
 /// The window's and the menu bar's connection to the runtime.
@@ -147,14 +128,13 @@ pub(crate) struct RuntimeHandle {
     meeting_requests: SyncSender<MeetingRequest>,
     recognition_controls: SyncSender<RecognitionControl>,
     history: Option<crate::history::History>,
-    event_path: PathBuf,
     indicator: crate::dictation::indicator::DictationIndicatorSender,
 }
 
 impl RuntimeHandle {
     /// The listener's event log, which the tour reads for practice dictations.
     pub(crate) fn event_path(&self) -> &Path {
-        &self.event_path
+        self.shared.event_path()
     }
 
     pub(crate) fn history(&self) -> Option<crate::history::History> {
@@ -296,18 +276,25 @@ fn watch_process() {
     procwatch::watch_with(config, |event, _| tracing::warn!(%event, "process watch"));
 }
 
-pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()> {
+pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool) -> Result<()> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Err(eyre!("desktop startup requires the main thread"));
     };
     shutdown.store(false, Ordering::Relaxed);
     watch_process();
+    // Observing first means a source change during startup still rebuilds
+    // the snapshot at the pump's first turn.
+    crate::keyboard_input_sources::start(mtm);
     crate::keyboard::initialize_layout()?;
     crate::updater::finish_on_launch();
     let _ = UPDATER.set(crate::updater::Updater::start());
-    // Never a silent launch failure: unreadable settings start with defaults
+    // Never a silent launch failure: invalid settings start with defaults
     // and the window says why (#744).
-    let (mut settings, settings_error) = AppSettings::load_for_launch();
+    let launch = AppSettings::load_for_launch();
+    let mut settings = launch.settings;
+    let settings_error = launch
+        .note
+        .map(crate::app_settings::LaunchNote::into_message);
     // Preload bundled feedback sounds on a worker so onboarding and the Sounds
     // sheet play immediately even before permissions let `recognition` start.
     // Opens no audio output device until a tone actually plays.
@@ -332,6 +319,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     let event_path = listener.event_path.clone();
     let event_log = crate::desktop::events::EventLog::create(&event_path)?;
     let drained_event_log = event_log.clone();
+    let transformations = Arc::new(crate::personal_commands::TransformationClient::default());
     let (developer_sender, developer_receiver) = mpsc::sync_channel(8);
     let (control_sender, control_receiver) = mpsc::sync_channel(8);
     let (recognition_controls, recognition_control_receiver) = mpsc::sync_channel(8);
@@ -341,6 +329,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
             developer_control: crate::DEVELOPER_FEATURES_ENABLED.then(|| developer_sender.clone()),
             dictation_control: Some(recognition_controls.clone()),
             control: Some(control_sender),
+            processing: crate::local_api::processing::profiles_processing(transformations.clone()),
             ..Default::default()
         },
     )?;
@@ -348,7 +337,6 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     let (controller_commands, controller_command_receiver) = mpsc::sync_channel(8);
     let (meeting_requests, meeting_request_receiver) = mpsc::sync_channel(8);
     let (indicator, indicator_events) = crate::dictation::indicator::channel();
-
     // The controller idles without inspecting microphone activity until the
     // user opts in to meetings (always available in developer builds).
     let controller = thread::Builder::new()
@@ -372,6 +360,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     let (recognition_start, start_receiver) = mpsc::sync_channel(1);
     let recognition_indicator = indicator.clone();
     let recognition_history = history.clone();
+    let started_at = crate::desktop::events::now_ms();
     let listener_failure = Arc::new(Mutex::new(None::<String>));
     let recognition_failure = listener_failure.clone();
     let recognition = thread::Builder::new()
@@ -398,6 +387,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
                     Some(recognition_indicator.clone()),
                     recognition_history,
                     Some(recognition_control_receiver),
+                    transformations,
                 )
             }));
             let failure = match result {
@@ -414,18 +404,21 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
                 Err(payload) => panic_message(payload.as_ref()),
             };
             *lock(&recognition_failure) = Some(failure);
-            recognition_indicator.send(DictationIndicatorEvent::Failed);
+            recognition_indicator.send(DictationIndicatorEvent::Failed { message: None });
         })?;
 
     let (requests, request_receiver) = mpsc::channel();
-    let shared = Arc::new(Shared::default());
+    let shared = Arc::new(Shared {
+        event_path: event_path.clone(),
+        started_at,
+        ..Shared::default()
+    });
     let handle = RuntimeHandle {
         requests: requests.clone(),
         shared: shared.clone(),
         meeting_requests: meeting_requests.clone(),
         recognition_controls: recognition_controls.clone(),
         history: history.clone(),
-        event_path,
         indicator: indicator.clone(),
     };
     RUNTIME
@@ -463,13 +456,20 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     let _ = WINDOW.set(window.clone());
     // The status item is created inside the loop; Hex can't run without a
     // way back to its window, so a failed item opens the window there.
-    let open_at_launch = settings_error.is_some()
-        || crate::meeting::watcher::should_open_app_on_launch(
+    // With the Dock icon shown, Hex starts windowless and opens the window
+    // once AppKit says the launch wasn't a login item.
+    let launch_window = if settings_error.is_some() {
+        LaunchWindow::Open
+    } else {
+        LaunchWindow::decide(
+            hidden,
             settings.show_dock_icon,
             setup_ready,
             onboarding_completed,
             true,
-        );
+        )
+    };
+    let open_at_launch = launch_window == LaunchWindow::Open;
     if let Some(error) = settings_error {
         window.update(move |ui, _| crate::rune_ui::show_error(ui, error));
     }
@@ -502,6 +502,28 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     #[cfg(hex_capture)]
     let capture_overlays =
         Some(crate::rune_ui::capture_capsule::feed::CaptureOverlays::install(&mut app));
+    // Labs › Screenshots: its own picker and the thumbnail.
+    #[cfg(hex_capture)]
+    crate::screenshots::install(&mut app);
+    // `hex dictation` and `hex paste-last` go straight to the listener; the
+    // rest reach the main thread's pump.
+    let (pump_calls, pump_call_receiver) = mpsc::sync_channel(8);
+    let control_runtime = handle.clone();
+    thread::Builder::new()
+        .name("hex-control".into())
+        .spawn(move || {
+            for call in control_receiver {
+                if let Some(call) = control::answer_off_main(&control_runtime, call) {
+                    if pump_calls.send(call).is_err() {
+                        return;
+                    }
+                    wake_pump();
+                }
+            }
+        })?;
+    // The pump idles between events, so its other senders wake it.
+    let controller_events = relay("hex-meeting-events", controller_events, 32)?;
+    let developer_receiver = relay("hex-developer-calls", developer_receiver, 8)?;
     let pump = Pump {
         window: window.clone(),
         capsules,
@@ -514,7 +536,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
         status_actions: None,
         controller_events,
         developer_calls: developer_receiver,
-        control_calls: control_receiver,
+        control_calls: pump_call_receiver,
         meeting_waiters: Vec::new(),
         meeting_state: MeetingMenuState::Idle,
         meeting_menu_at: Instant::now(),
@@ -552,6 +574,9 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     // is in place before the loop runs; the rest of `target` waits below.
     let target = MenuTarget::new(mtm);
     observe_termination(&target);
+    if launch_window == LaunchWindow::OpenUnlessLoginItem {
+        observe_launch(&target);
+    }
     // The status item, HUD, and main menu wait for the window's first frame
     // so it reaches the screen without them; a launch without a window sets
     // them up in the loop's first turn. None of these updates change what the
@@ -589,234 +614,6 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
 static DRAIN: crate::desktop::process_exit::Drain = crate::desktop::process_exit::Drain::new();
 
 // ---------------------------------------------------------------------------
-// Runtime thread
-
-fn run_runtime(
-    settings: AppSettings,
-    initial_input_source: Option<String>,
-    requests: Receiver<Request>,
-    shared: &Shared,
-    shutdown: &AtomicBool,
-    recognition_start: Option<SyncSender<()>>,
-    listener_failure: Arc<Mutex<Option<String>>>,
-) {
-    let mut runtime = Runtime {
-        keyboard_switcher: crate::transcription::keyboard_model_switching::Switcher::new(
-            settings.keyboard_model_switching.clone(),
-            initial_input_source,
-        ),
-        automatic_preparation: false,
-        settings,
-        preparation: TranscriptionPreparation::default(),
-        recognition_start,
-        listener_failure,
-    };
-    loop {
-        let mut next = match requests.recv_timeout(RUNTIME_TICK) {
-            Ok(request) => Some(request),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        while let Some(request) = next {
-            runtime.handle(request);
-            next = requests.try_recv().ok();
-        }
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        runtime.tick();
-        let published = Arc::new(runtime.publish());
-        let changed = {
-            let mut current = lock(&shared.published);
-            let changed = current.as_deref() != Some(&published);
-            if changed {
-                *current = Some(published);
-            }
-            changed
-        };
-        if changed {
-            for wake in lock(&shared.wakers).iter() {
-                wake();
-            }
-        }
-    }
-    runtime.preparation.cancel();
-}
-
-/// Two selections that load the same thing.
-fn same_model_and_language(left: &TranscriptionSelection, right: &TranscriptionSelection) -> bool {
-    left.model == right.model && left.language == right.language
-}
-
-struct Runtime {
-    settings: AppSettings,
-    preparation: TranscriptionPreparation,
-    keyboard_switcher: crate::transcription::keyboard_model_switching::Switcher,
-    automatic_preparation: bool,
-    /// Starts the listener once setup is ready; `None` once started.
-    recognition_start: Option<SyncSender<()>>,
-    /// Why the listener stopped, once it has.
-    listener_failure: Arc<Mutex<Option<String>>>,
-}
-
-impl Runtime {
-    fn handle(&mut self, request: Request) {
-        match request {
-            Request::ChooseModel { model, language } => {
-                self.manual_choice();
-                let selection = TranscriptionSelection { model, language };
-                self.preparation.start(selection, false);
-            }
-            Request::SelectInstalledModel(model) => {
-                self.reload_settings();
-                self.manual_choice();
-                self.preparation
-                    .start(self.settings.transcription_for_model(model), true);
-            }
-            Request::UseInstalledSelection(selection) => {
-                self.manual_choice();
-                // `hex model use` replies "already in use" on the same test.
-                if !same_model_and_language(&selection, &self.settings.transcription) {
-                    self.preparation.start(selection, true);
-                }
-            }
-            Request::InputSourceChanged(source) => {
-                if self
-                    .keyboard_switcher
-                    .source_changed(source, Instant::now())
-                {
-                    self.supersede_automatic();
-                }
-            }
-            Request::CancelModel => {
-                self.manual_choice();
-                self.preparation.cancel();
-            }
-            Request::ReloadSettings => self.reload_settings(),
-            Request::Desktop(_)
-            | Request::CaptureShortcutFor(_)
-            | Request::CancelShortcut
-            | Request::SetShortcut { .. } => {}
-        }
-    }
-
-    fn reload_settings(&mut self) {
-        match AppSettings::load() {
-            Ok(settings) => {
-                if self
-                    .keyboard_switcher
-                    .configure(settings.keyboard_model_switching.clone(), Instant::now())
-                {
-                    self.supersede_automatic();
-                }
-                self.settings = settings;
-            }
-            Err(error) => tracing::warn!(%error, "could not reload settings"),
-        }
-    }
-
-    fn manual_choice(&mut self) {
-        self.keyboard_switcher.manual_choice();
-        if self.automatic_preparation {
-            self.preparation.cancel();
-            self.automatic_preparation = false;
-        }
-    }
-
-    fn supersede_automatic(&mut self) {
-        // A source being cycled through must not cancel a manual operation.
-        // Manual work is superseded only when the debounced choice is due.
-        if self.automatic_preparation {
-            self.preparation.cancel();
-            self.automatic_preparation = false;
-        }
-    }
-
-    /// Commits a prepared model and starts a listener that waited for setup.
-    fn tick(&mut self) {
-        self.tick_at(Instant::now());
-    }
-
-    fn tick_at(&mut self, now: Instant) {
-        if let Some(choice) = self.keyboard_switcher.take_due(now) {
-            let selection = TranscriptionSelection {
-                language: choice.language,
-                ..self.settings.transcription_for_model(choice.model)
-            };
-            if !same_model_and_language(&selection, &self.settings.transcription) {
-                self.preparation.start(selection, true);
-                self.automatic_preparation = true;
-            } else {
-                // The debounced choice keeps the current model, but must
-                // still prevent an older manual preparation replacing it.
-                self.preparation.cancel();
-                self.automatic_preparation = false;
-            }
-        }
-        if let Some(result) = self.preparation.poll() {
-            self.automatic_preparation = false;
-            let result = result.and_then(|selection| {
-                crate::transcription::models::validate(&selection).map_err(|e| e.to_string())?;
-                let mut settings = AppSettings::load().map_err(|e| format!("{e:#}"))?;
-                settings
-                    .save_transcription(selection)
-                    .map_err(|e| format!("{e:#}"))?;
-                self.settings = settings;
-                Ok(())
-            });
-            match result {
-                Ok(()) => self.preparation.set_error(None),
-                Err(error) => {
-                    tracing::warn!(%error, "could not select transcription model");
-                    self.preparation.set_error(Some(error));
-                }
-            }
-        }
-        if self.recognition_start.is_some()
-            && crate::desktop::onboarding::status(&self.settings.transcription).ready()
-            && let Some(start) = self.recognition_start.take()
-        {
-            let _ = start.try_send(());
-        }
-    }
-
-    fn publish(&self) -> Published {
-        let preparation = self.preparation.status();
-        let failure = lock(&self.listener_failure).clone();
-        let running = self.recognition_start.is_none() && failure.is_none();
-        Published {
-            listener: DesktopListenerSnapshot {
-                running,
-                status: if failure.is_some() {
-                    "Stopped"
-                } else if running {
-                    "Enabled"
-                } else {
-                    "Waiting for setup"
-                }
-                .into(),
-                warning: failure,
-                shortcuts: DesktopShortcuts::Registered,
-                shortcuts_configurable: false,
-            },
-            transcription: DesktopTranscriptionSnapshot {
-                downloaded_bytes: preparation.downloaded_bytes,
-                error: preparation.error.clone(),
-                preparation_stage: preparation
-                    .model
-                    .map(|_| ModelPreparationStage::Downloading),
-                selection: self.settings.transcription.clone(),
-                preparing: preparation.model,
-            },
-            update_status: update_status(),
-            update_notes: UPDATER.get().and_then(crate::updater::Updater::notes),
-            settings: self.settings.clone(),
-            preparation,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Main thread: status item, menu, reopen, HUD
 
 struct Pump {
@@ -844,6 +641,8 @@ struct PumpState {
     /// Created on the main thread, so it stays out of the `Send` [`Pump`].
     indicator: DictationIndicatorUi,
     timer: Retained<NSTimer>,
+    /// The timer runs every frame, not at the idle interval ([`wake`]).
+    fast: bool,
     _menu_target: Retained<MenuTarget>,
 }
 
@@ -895,7 +694,9 @@ fn start_main_thread() {
     let Some(Launch { mut pump, target }) = LAUNCH.with(|slot| slot.borrow_mut().take()) else {
         return;
     };
-    pump.status_actions = match crate::macos_rune::status_item::install() {
+    pump.status_actions = match crate::macos_rune::status_item::install().and_then(|actions| {
+        relay("hex-status-actions", actions, 8).map_err(color_eyre::Report::from)
+    }) {
         Ok(actions) => Some(actions),
         Err(error) => {
             tracing::error!(%error, "could not install Hex status item; opening the window");
@@ -913,6 +714,8 @@ fn start_main_thread() {
     );
     let indicator = DictationIndicatorUi::new(pump.hud.clone());
     install_main_menu(&target, mtm);
+    observe_activation(&target);
+    crate::suppression::secure_input::start(mtm);
     // Inside the loop, once AppKit has started, so its own Apple event setup
     // can't replace this handler.
     // SAFETY: the target outlives the handler (kept in PUMP for the app's
@@ -926,40 +729,34 @@ fn start_main_thread() {
             andEventID: REOPEN_APPLICATION,
         ];
     }
-    let block = RcBlock::new(|_: std::ptr::NonNull<NSTimer>| {
-        PUMP.with(|slot| {
-            if let Some(state) = slot.borrow_mut().as_mut() {
-                if let Some(mtm) = MainThreadMarker::new() {
-                    let switching = state.pump.runtime.published().is_some_and(|published| {
-                        published.settings.keyboard_model_switching.enabled
-                    });
-                    crate::keyboard_input_sources::observe(mtm, switching);
-                    if let Some(source) = crate::keyboard_input_sources::take_change(mtm) {
-                        let _ = state.pump.runtime.send(Request::InputSourceChanged(source));
-                    }
-                }
-                state.pump.tick(&mut state.indicator);
-            }
-        });
-    });
-    // SAFETY: the timer runs its block on this (main) thread's run loop.
-    let timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_repeats_block(PUMP_INTERVAL, true, &block)
-    };
-    // Keep firing while a menu is open (event-tracking run loop mode).
-    // SAFETY: adding a scheduled timer to the main run loop's common modes.
-    unsafe {
-        let run_loop = objc2_foundation::NSRunLoop::mainRunLoop();
-        run_loop.addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes);
-    }
+    let fast = indicator.animating();
+    let timer = start_pump_timer(fast);
     PUMP.with(|slot| {
         *slot.borrow_mut() = Some(PumpState {
             pump,
             indicator,
             timer,
+            fast,
             _menu_target: target,
         });
     });
+    // Anything sent before the pump existed is drained now.
+    pump_now();
+}
+
+/// Rebuilds the keyboard layout snapshot after the selected input source
+/// changed, here on the main thread, so a later ⌘V posts the key that types
+/// V now (t1304). Shortcuts on letter keys follow it; the listener rebinds a
+/// shortcut only once its machine is idle, so a recording goes on.
+fn refresh_keyboard_layout(mtm: MainThreadMarker) {
+    match crate::keyboard::refresh_layout(mtm) {
+        Ok(true) => {
+            tracing::info!("keyboard layout changed");
+            crate::app_settings::refresh_layout_hotkeys();
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "could not read the new keyboard layout"),
+    }
 }
 
 /// Whether the window is on screen.
@@ -971,6 +768,12 @@ fn window_visible() -> bool {
 fn show(window: &rune::AppHandle<Ui>, destination: Destination) {
     window.update(move |ui, tx| crate::rune_ui::show(ui, destination, tx));
     bring_forward(window);
+}
+
+/// Opens the window where its footer shows the update check's outcome.
+fn show_update_check(window: &rune::AppHandle<Ui>) {
+    window.update(|ui, _| crate::rune_ui::update_check_asked(ui));
+    show(window, Destination::Settings);
 }
 
 /// Opens the window in front, from the main thread.
@@ -1035,10 +838,8 @@ impl Pump {
         }
         self.settle_meeting_waiters(None);
         #[cfg(hex_capture)]
-        if let Some(overlays) = &mut self.capture_overlays
-            && let Some(shown) = overlays.follow_recordings()
-        {
-            crate::macos_rune::status_item::update_overlays_in_recordings(shown);
+        if let Some(overlays) = &mut self.capture_overlays {
+            overlays.follow_recordings();
         }
         if self.status_actions.is_none() {
             return;
@@ -1050,6 +851,7 @@ impl Pump {
                     &published.settings,
                     &published.preparation,
                 );
+                crate::macos_rune::status_item::update_paste_last(&published.settings);
             }
             self.model_menu_at = now + MODEL_MENU_REFRESH;
         }
@@ -1059,6 +861,7 @@ impl Pump {
                 crate::app_settings::meetings_enabled(),
             );
             crate::macos_rune::status_item::update_software(&update_status());
+            crate::macos_rune::status_item::update_pause();
             self.meeting_menu_at = now + MEETING_MENU_REFRESH;
         }
     }
@@ -1103,9 +906,16 @@ impl Pump {
                 }
             }
             StatusItemAction::Update => {
-                if let Some(updater) = UPDATER.get()
-                    && let Err(error) = update_action(&updater.menu_action())
-                {
+                let Some(updater) = UPDATER.get() else {
+                    return;
+                };
+                let action = updater.menu_action();
+                // A check from the menu bar opens the window, whose footer
+                // says how it went: up to date or couldn't check (#1120).
+                if action == DesktopAction::CheckForUpdates {
+                    show_update_check(&self.window);
+                }
+                if let Err(error) = update_action(&action) {
                     tracing::warn!(error = %format!("{error:#}"), "the update menu item failed");
                 }
             }
@@ -1141,30 +951,20 @@ impl Pump {
                 }
             }
             StatusItemAction::OpenMeetings => show(&self.window, Destination::Meetings(None)),
-            #[cfg(hex_capture)]
-            StatusItemAction::ToggleOverlaysInRecordings => self.toggle_overlays_in_recordings(),
+            // Labs › Pause from menu bar: only keyboard shortcuts stop; the
+            // menu's own actions keep working. The row says Resume Hex while
+            // a resume waits, and choosing it again leaves it waiting.
+            StatusItemAction::TogglePause => {
+                crate::shortcut_pause::toggle();
+                // Carbon hotkeys register for secure input, so a pause must
+                // drop them and a resume re-add them now, not at the next
+                // quarter-second poll.
+                crate::suppression::secure_input::refresh();
+                crate::macos_rune::status_item::update_pause();
+            }
             StatusItemAction::Quit => {
                 self.runtime_cancel();
                 self.window.quit();
-            }
-        }
-    }
-
-    /// Saves the flipped setting as the window would; the overlays and the
-    /// menu item follow it from [`Pump::tick`].
-    #[cfg(hex_capture)]
-    fn toggle_overlays_in_recordings(&self) {
-        let saved = AppSettings::load().and_then(|mut settings| {
-            settings.capture.show_overlays_in_recordings =
-                !settings.capture.show_overlays_in_recordings;
-            settings.save()
-        });
-        match saved {
-            Ok(()) => {
-                let _ = self.runtime.send(Request::ReloadSettings);
-            }
-            Err(error) => {
-                tracing::warn!(error = %format!("{error:#}"), "could not save the recordings setting");
             }
         }
     }
@@ -1182,7 +982,11 @@ impl Pump {
                     id,
                     title,
                     chapters: Vec::new(),
+                    warning: None,
                 };
+            }
+            ControllerEvent::SourceWarning { warning } => {
+                self.meeting_state.source_warning(warning)
             }
             ControllerEvent::Chapters(chapters) => {
                 if let MeetingMenuState::Recording {
@@ -1219,6 +1023,13 @@ impl Pump {
                 let message = format!("{title}: {error}");
                 self.window
                     .update(move |ui, _| crate::rune_ui::meeting_failed(ui, message));
+                show(&self.window, Destination::Meetings(None));
+            }
+            ControllerEvent::ImportFailed { error } => {
+                tracing::error!(%error, "meeting audio import failed");
+                let message = error.clone();
+                self.window
+                    .update(move |ui, _| crate::rune_ui::meeting_import_failed(ui, message));
                 show(&self.window, Destination::Meetings(None));
             }
         }
@@ -1295,6 +1106,7 @@ objc2::define_class!(
 
         #[unsafe(method(checkForUpdates:))]
         fn check_for_updates(&self, _sender: Option<&AnyObject>) {
+            with_window(show_update_check);
             let _ = update_action(&crate::desktop::host::DesktopAction::CheckForUpdates);
         }
 
@@ -1305,7 +1117,13 @@ objc2::define_class!(
 
         #[unsafe(method(quitHex:))]
         fn quit_hex(&self, _sender: Option<&AnyObject>) {
-            with_window(|window| window.quit());
+            // Labs › ⌘Q closes Settings: the window hides and Hex keeps
+            // dictating; the status item's Quit Hex still quits.
+            if crate::labs::quit_closes_window() {
+                with_window(|window| window.close());
+            } else {
+                with_window(|window| window.quit());
+            }
         }
 
         #[unsafe(method(closeWindow:))]
@@ -1333,6 +1151,32 @@ objc2::define_class!(
             with_window(|window| show(window, Destination::Settings));
         }
 
+        /// Observed only when the Dock icon is shown and setup is done: a
+        /// manual launch opens the window, a login-item launch stays quiet.
+        #[unsafe(method(applicationDidFinishLaunching:))]
+        fn application_did_finish_launching(&self, _notification: Option<&AnyObject>) {
+            let login_item = launched_as_login_item();
+            if LaunchWindow::OpenUnlessLoginItem.opens(login_item) {
+                with_window(bring_forward);
+            } else {
+                tracing::info!("launched as a login item; starting without the window");
+            }
+        }
+
+        /// ⌘Tab (or any activation) with the window closed opens it where
+        /// it was, as clicking the Dock icon does.
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn application_did_become_active(&self, _notification: Option<&AnyObject>) {
+            let app = NSApplication::sharedApplication(self.mtm());
+            if !take_login_launch_activation() && reopen_on_activation(
+                app.activationPolicy() == NSApplicationActivationPolicy::Regular,
+                app.keyWindow().is_some(),
+                window_visible(),
+            ) {
+                with_window(bring_forward);
+            }
+        }
+
         /// `-[NSApplication terminate:]` calls `exit` right after this.
         #[unsafe(method(applicationWillTerminate:))]
         fn application_will_terminate(&self, _notification: Option<&AnyObject>) {
@@ -1358,80 +1202,4 @@ fn with_window(f: impl FnOnce(&rune::AppHandle<Ui>)) {
     if let Some(window) = WINDOW.get() {
         f(window);
     }
-}
-
-/// The menu bar while the window is active: Hex, File, View (with the
-/// Labs), Window.
-/// Rune draws no Edit menu items, so ⌘C/⌘V reach its text fields as keys.
-fn install_main_menu(target: &MenuTarget, mtm: MainThreadMarker) {
-    let main = NSMenu::new(mtm);
-    let name = crate::app_paths::app_name();
-    let (hide, quit) = (format!("Hide {name}"), format!("Quit {name}"));
-    let mut application = vec![];
-    if !crate::updater::managed_by_policy() {
-        application.push(Some(("Check for Updates…", sel!(checkForUpdates:), "")));
-        application.push(None);
-    }
-    application.extend([
-        Some(("Settings…", sel!(showSettings:), ",")),
-        None,
-        Some((hide.as_str(), sel!(hideHex:), "h")),
-        None,
-        Some((quit.as_str(), sel!(quitHex:), "q")),
-    ]);
-    let mut menus = vec![
-        (name, application),
-        (
-            "File",
-            vec![Some(("Close Window", sel!(closeWindow:), "w"))],
-        ),
-    ];
-    // Rune's own View › Playground item, which this menu bar replaces. A
-    // capital letter adds Shift: ⇧⌘D. It opens the playground only while
-    // Labs › Playground is on.
-    menus.push((
-        "View",
-        vec![Some(("Playground", sel!(togglePlayground:), "D"))],
-    ));
-    menus.push((
-        "Window",
-        vec![Some(("Minimize", sel!(minimizeWindow:), "m"))],
-    ));
-    for (title, items) in menus {
-        let menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str(title));
-        for item in items {
-            match item {
-                Some((title, action, key)) => {
-                    menu.addItem(&menu_item(target, title, action, key, mtm));
-                }
-                None => menu.addItem(&NSMenuItem::separatorItem(mtm)),
-            }
-        }
-        let heading = NSMenuItem::new(mtm);
-        heading.setSubmenu(Some(&menu));
-        main.addItem(&heading);
-    }
-    NSApplication::sharedApplication(mtm).setMainMenu(Some(&main));
-}
-
-fn menu_item(
-    target: &MenuTarget,
-    title: &str,
-    action: Sel,
-    key: &str,
-    mtm: MainThreadMarker,
-) -> Retained<NSMenuItem> {
-    // SAFETY: a plain menu item whose action the target implements.
-    let item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
-            Some(action),
-            &NSString::from_str(key),
-        )
-    };
-    item.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
-    // SAFETY: the target lives as long as the app (kept in PUMP).
-    unsafe { item.setTarget(Some(target)) };
-    item
 }

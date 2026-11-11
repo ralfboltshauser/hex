@@ -13,7 +13,7 @@ use super::flow::{
 };
 use super::surface::{Id, PANEL_H, PANEL_W, TOP};
 use super::{CapsuleState, poll, trace_channels, view};
-use crate::capture_host::CaptureNeed;
+use crate::capture_host::{AskedBy, CaptureNeed};
 
 fn guess() -> Route {
     Route::Guess {
@@ -75,9 +75,11 @@ fn no_answer() -> Route {
 enum Beat {
     In(Input),
     Click(Id),
+    /// The pointer moves onto the open list's row.
+    Point(usize),
 }
 
-use Beat::{Click, In};
+use Beat::{Click, In, Point};
 
 /// `pres` after `beats`, each a second apart, read just after the last.
 fn after(beats: &[Beat]) -> Pres {
@@ -91,6 +93,9 @@ fn after(beats: &[Beat]) -> Pres {
             }
             Click(id) => {
                 flow.click(*id, now);
+            }
+            Point(row) => {
+                flow.point(*row, true);
             }
         }
     }
@@ -164,6 +169,12 @@ fn stills() -> Vec<(&'static str, Pres)> {
             ))]),
         ),
         ("rule-sent", after(&routed(rule()))),
+        (
+            "rule-resolving",
+            after(&routed(Route::ResolvingRule {
+                name: "board".into(),
+            })),
+        ),
         ("rule-final", {
             let mut flow = Flow::new();
             flow.input(Input::Routed(rule()), 0.0);
@@ -171,8 +182,10 @@ fn stills() -> Vec<(&'static str, Pres)> {
             flow.pres(undo_s() + 1.0)
         }),
         ("guess", after(&routed(guess()))),
+        // Shift down with the pointer on HEX: that row is where it goes.
         ("shift", {
             let mut beats = routed(guess());
+            beats.push(Point(1));
             beats.push(In(Input::Shift(true)));
             after(&beats)
         }),
@@ -261,12 +274,18 @@ fn stills() -> Vec<(&'static str, Pres)> {
         }),
         (
             "permission",
-            after(&[In(Input::NeedsPermission(CaptureNeed::ScreenRecording))]),
+            after(&[In(Input::NeedsPermission(
+                CaptureNeed::ScreenRecording,
+                AskedBy::Capture,
+            ))]),
         ),
         (
             "permission-asked",
             after(&[
-                In(Input::NeedsPermission(CaptureNeed::ScreenRecording)),
+                In(Input::NeedsPermission(
+                    CaptureNeed::ScreenRecording,
+                    AskedBy::Capture,
+                )),
                 Click(Id::Ask),
             ]),
         ),
@@ -274,7 +293,10 @@ fn stills() -> Vec<(&'static str, Pres)> {
         ("permission-ready", permission(Grant::Ready)),
         (
             "permission-microphone",
-            after(&[In(Input::NeedsPermission(CaptureNeed::Microphone))]),
+            after(&[In(Input::NeedsPermission(
+                CaptureNeed::Microphone,
+                AskedBy::Capture,
+            ))]),
         ),
     ]
 }
@@ -282,7 +304,10 @@ fn stills() -> Vec<(&'static str, Pres)> {
 /// The permission helper for Screen Recording once its grant is `grant`.
 fn permission(grant: Grant) -> Pres {
     after(&[
-        In(Input::NeedsPermission(CaptureNeed::ScreenRecording)),
+        In(Input::NeedsPermission(
+            CaptureNeed::ScreenRecording,
+            AskedBy::Capture,
+        )),
         In(Input::Permission(CaptureNeed::ScreenRecording, grant)),
     ])
 }
@@ -356,9 +381,10 @@ fn every_state_draws_its_pieces() {
         ("processing", &["processing"]),
         ("saved", &["done", "paste", "inspect", "close"]),
         ("failed", &["done", "close"]),
-        ("rule-sent", &["done", "why", "undo", "close"]),
-        ("rule-final", &["done", "why", "paste", "inspect", "close"]),
-        ("guess", &["done", "ask", "list", "row-SEER", "remembers"]),
+        // A rule's send counts down on the Undo chip, with no words.
+        ("rule-sent", &["done", "undo", "close"]),
+        ("rule-final", &["done", "paste", "inspect", "close"]),
+        ("guess", &["done", "ask", "list", "row-SEER", "shift-hint"]),
         ("guess-five", &["done", "ask", "list", "row-SEER"]),
         ("no-answer", &["done", "why", "ask", "list"]),
         (
@@ -383,7 +409,7 @@ fn every_state_draws_its_pieces() {
         ("list-guess", &["paste", "inspect"]),
         // Trimmed to Search and ✕: the capture is already copied.
         ("guess", &["field", "paste", "inspect", "footer"]),
-        ("rule-sent", &["paste", "ask", "inspect"]),
+        ("rule-sent", &["why", "paste", "ask", "inspect"]),
         ("rule-final", &["ask"]),
         ("sent", &["paste", "inspect"]),
     ];
@@ -465,11 +491,11 @@ fn the_widest_states_fit_the_panel() {
     }
 }
 
-/// The capsule says its shortcuts in quiet text ("⏎", "esc"), a hint's
-/// keys in one small rect at most. The one keycap tray is Search's: the
-/// capture shortcut that opens it, drawn as Settings draws it.
+/// Keycaps, as Settings draws a shortcut, are for Search's chip and the
+/// hints under the list; a chip on the top line says its shortcut in quiet
+/// text ("Next ⇥").
 #[test]
-fn the_capsule_draws_keycaps_only_on_search() {
+fn the_capsule_draws_keycaps_only_on_search_and_hints() {
     for (name, pres) in stills() {
         let rt = runtime(pres, false);
         for e in rt.elements() {
@@ -478,7 +504,10 @@ fn the_capsule_draws_keycaps_only_on_search() {
                 .as_deref()
                 .is_some_and(|k| k == "keys" || k.starts_with("keycap"));
             assert!(
-                !keycap || e.path.contains("ask-keys"),
+                !keycap
+                    || ["ask-keys", "footer", "card-hints"]
+                        .iter()
+                        .any(|at| e.path.contains(at)),
                 "{name}: {} is a keycap",
                 e.path
             );
@@ -496,15 +525,27 @@ fn render(gpu: &rune::render::Gpu, pres: Pres, dark: bool) -> (u32, u32, Vec<u8>
         _ => {
             // A card's guesses hang under the line.
             use super::surface::{Anchor, anchor_for, layout_at};
-            let (shell, _) = layout_at(&pres, "0:00", anchor_for(&pres, Anchor::Top));
+            let (shell, _) = layout_at(
+                &pres,
+                "0:00",
+                anchor_for(&pres, Anchor::Top),
+                super::notch::Geometry::default(),
+            );
             (shell[1] + shell[3] + 36.0).max(TOP + 40.0 + 36.0)
         }
     };
-    let rt = runtime(pres, dark);
+    draw(gpu, &mut runtime(pres, dark), height)
+}
+
+/// Pixels of `rt`'s panel's top `height` points, at 2×.
+fn draw(
+    gpu: &rune::render::Gpu,
+    rt: &mut Runtime<CapsuleState>,
+    height: f32,
+) -> (u32, u32, Vec<u8>) {
     let (w, h) = ((PANEL_W * 2.0) as u32, (PANEL_H * 2.0) as u32);
     let mut renderer = crate::rune_ui::offscreen::renderer(&gpu.device);
     let target = crate::rune_ui::offscreen::target(&gpu.device, w, h);
-    let mut rt = rt;
     renderer.upload_images(&gpu.device, &gpu.queue, &mut rt.images);
     renderer.prepare(
         &gpu.device,
@@ -544,6 +585,7 @@ const GOLDENS: &[&str] = &[
     "processing",
     "saved",
     "rule-sent",
+    "rule-resolving",
     "rule-final",
     "guess",
     "shift",
@@ -577,13 +619,26 @@ fn capture_capsule_goldens() {
                 rune::render::write_png(&path, w, h, &pixels).unwrap();
                 continue;
             }
-            assert!(
-                path.exists(),
-                "{} is missing; run with HEX_UPDATE_GOLDENS=1",
-                path.display()
-            );
+            let actual = std::env::temp_dir().join(format!(
+                "rune-settings-capture-capsule-{name}-{theme}-actual.png"
+            ));
+            if !path.exists() {
+                rune::render::write_png(&actual, w, h, &pixels).unwrap();
+                misses.push(format!(
+                    "{name}-{theme}: missing golden; actual at {}",
+                    actual.display()
+                ));
+                continue;
+            }
             let (golden_w, golden_h, golden) = read_png(&path);
-            assert_eq!((golden_w, golden_h), (w, h), "{name}-{theme} size changed");
+            if (golden_w, golden_h) != (w, h) {
+                rune::render::write_png(&actual, w, h, &pixels).unwrap();
+                misses.push(format!(
+                    "{name}-{theme}: size changed; actual at {}",
+                    actual.display()
+                ));
+                continue;
+            }
             // GPUs differ in the last bit of blending and glyph coverage; a
             // layout or colour change moves far more.
             let differing = pixels
@@ -592,8 +647,6 @@ fn capture_capsule_goldens() {
                 .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 12))
                 .count();
             if differing > (w * h) as usize / 500 {
-                let actual =
-                    std::env::temp_dir().join(format!("capture-capsule-{name}-{theme}-actual.png"));
                 rune::render::write_png(&actual, w, h, &pixels).unwrap();
                 misses.push(format!(
                     "{name}-{theme}: {differing} pixels differ; actual at {}",
@@ -642,13 +695,17 @@ fn top_line_from_env() {
     }
 }
 
-/// `HEX_CAPSULE_SNAPS=<folder>` writes every state, light and dark.
+/// `HEX_CAPSULE_SNAPS=<folder>` writes every state, light and dark;
+/// `HEX_CAPSULE_LANGUAGE=de` (any interface language code) in that language.
 #[test]
 fn capture_capsule_snapshots() {
     let Some(folder) = std::env::var_os("HEX_CAPSULE_SNAPS") else {
         return;
     };
     top_line_from_env();
+    if let Ok(language) = std::env::var("HEX_CAPSULE_LANGUAGE") {
+        crate::desktop::i18n::apply(Some(&language));
+    }
     let Ok(gpu) = rune::render::Gpu::try_new(rune::render::Gpu::instance(), None) else {
         eprintln!("skipping capture capsule snapshots: no GPU adapter");
         return;
@@ -720,6 +777,19 @@ fn scripts() -> Vec<Script> {
                 (3.2, stage(Stage::Stopping)),
             ],
             end: 4.4,
+        },
+        // The capsule's whole life, nothing routed: it comes in recording,
+        // narrows to processing, widens to "Copied", and leaves.
+        Script {
+            name: "lifecycle",
+            beats: vec![
+                (0.2, stage(Stage::Recording)),
+                (1.6, stage(Stage::Stopping)),
+                (1.8, stage(Stage::Transcribing)),
+                (3.0, stage(Stage::Done)),
+                (4.4, In(Input::Dismiss)),
+            ],
+            end: 5.4,
         },
         Script {
             name: "chips-close",
@@ -931,6 +1001,7 @@ fn play(
                     tx.wake_after(std::time::Duration::ZERO);
                 }
                 Click(id) => s.click(id, tx),
+                Point(row) => s.point(row, true, tx),
             });
             next += 1;
         }
@@ -1070,12 +1141,16 @@ fn presses_reach_the_host() {
 /// The live capsule after `inputs`, at rest, with every action it hands the
 /// host recorded.
 fn live(inputs: Vec<Input>) -> (Runtime<CapsuleState>, Arc<Mutex<Vec<Action>>>) {
+    live_in(inputs, true)
+}
+
+fn live_in(inputs: Vec<Input>, dark: bool) -> (Runtime<CapsuleState>, Arc<Mutex<Vec<Action>>>) {
     let mut state = CapsuleState::new(false);
     let actions: Arc<Mutex<Vec<Action>>> = Arc::default();
     let record = actions.clone();
     state.act = Some(Arc::new(move |action| record.lock().unwrap().push(action)));
     let mut rt =
-        crate::rune_ui::offscreen::runtime(state, view, (PANEL_W, PANEL_H), env(true), text());
+        crate::rune_ui::offscreen::runtime(state, view, (PANEL_W, PANEL_H), env(dark), text());
     rt.poll = Some(poll);
     rt.frame(0.0);
     for input in inputs {
@@ -1128,6 +1203,71 @@ fn click_on(rt: &mut Runtime<CapsuleState>, key: &str, nth: usize) {
     settle(rt);
 }
 
+/// Moves the pointer onto the middle of the live element keyed `key`, a
+/// few points at a time as a hand does, and lets it rest there.
+fn point_at(rt: &mut Runtime<CapsuleState>, key: &str) {
+    let [x, y, w, h] = rt
+        .elements()
+        .iter()
+        .find(|e| !e.exiting && e.key.as_deref().and_then(|k| k.split('#').next()) == Some(key))
+        .unwrap_or_else(|| panic!("no {key} in {:?}", keys(rt)))
+        .rect;
+    let (cx, cy) = (x + w * 0.5, y + h * 0.5);
+    for step in [6.0, 3.0, 0.0] {
+        rt.pointer_move(cx - step, cy);
+        rt.frame(1.0 / FPS);
+    }
+    settle(rt);
+}
+
+/// `input` from Hex's tap, as a key reaches the live capsule.
+fn tap(rt: &mut Runtime<CapsuleState>, input: Input) {
+    rt.update(move |s, tx| {
+        s.inbox.push(input);
+        tx.wake_after(std::time::Duration::ZERO);
+    });
+    settle(rt);
+}
+
+/// `HEX_CAPSULE_HOVER_SNAPS=<folder>` writes the live capsule with the
+/// pointer resting on RUNE, the fourth row, and Shift down, over the
+/// suggestions and over the search, light and dark.
+#[test]
+fn capture_capsule_hover_snapshots() {
+    let Some(folder) = std::env::var_os("HEX_CAPSULE_HOVER_SNAPS") else {
+        return;
+    };
+    let Ok(gpu) = rune::render::Gpu::try_new(rune::render::Gpu::instance(), None) else {
+        eprintln!("skipping capture capsule hover snapshots: no GPU adapter");
+        return;
+    };
+    let folder = std::path::PathBuf::from(folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    for (name, search) in [("suggestions", false), ("search", true)] {
+        for dark in [false, true] {
+            let mut inputs = vec![processing_input(), Input::Routed(guess())];
+            if search {
+                inputs.push(Input::OpenList);
+            }
+            let (mut rt, _) = live_in(inputs, dark);
+            rt.state.backdrop = true;
+            point_at(&mut rt, "row-RUNE");
+            tap(&mut rt, Input::Shift(true));
+            let height = match &rt.state.surface.pres {
+                Pres::Done(super::flow::Done {
+                    open: Some((_, list)),
+                    ..
+                }) => super::surface::LIST_Y + super::list_height(list) + 28.0,
+                pres => panic!("{name}: no list in {pres:?}"),
+            };
+            let (w, h, pixels) = draw(&gpu, &mut rt, height);
+            let theme = if dark { "dark" } else { "light" };
+            let path = folder.join(format!("shift-hover-{name}-{theme}.png"));
+            rune::render::write_png(&path, w, h, &pixels).unwrap();
+        }
+    }
+}
+
 /// Clicking any of the capsule's choices does what it says, in every flow:
 /// a suggestion, a search result, Search, Undo and the list it brings
 /// back, ✕, and each flow's picks. The tap's press
@@ -1159,18 +1299,20 @@ fn clicks_on_the_capsule_do_what_they_say() {
         click_on(&mut rt, "ask", 0);
         assert!(keys(&rt).iter().any(|k| k == "field"), "{:?}", keys(&rt));
 
-        // A rule's send: Undo takes it back and offers the list again, where
-        // a click redirects it.
+        // A rule's send: pointing at Undo holds it, Undo takes it back and
+        // offers the list again, where a click redirects it.
         let (mut rt, actions) = live(routed(rule()));
         click_on(&mut rt, "undo", 0);
-        assert_eq!(
-            *actions.lock().unwrap(),
-            vec![Action::Undo { to: "SEER".into() }]
-        );
+        let undo = [
+            Action::Hold(true),
+            Action::Undo { to: "SEER".into() },
+            Action::Hold(false),
+        ];
+        assert_eq!(*actions.lock().unwrap(), undo);
         click_on(&mut rt, "row-HOME", 0);
         assert_eq!(
             *actions.lock().unwrap(),
-            vec![Action::Undo { to: "SEER".into() }, send("HOME")]
+            [undo.as_slice(), &[send("HOME")]].concat()
         );
 
         // ✕ closes.
@@ -1189,6 +1331,51 @@ fn clicks_on_the_capsule_do_what_they_say() {
             assert_eq!(*actions.lock().unwrap(), vec![send("HEX")], "{flow:?}");
         });
     }
+}
+
+/// Kit: holding Shift over a row marked the keyboard's row instead. The
+/// live capsule marks the row under the pointer, its header says where,
+/// and a Shift click there saves the rule for it, over the suggestions
+/// and in the search.
+#[test]
+fn shift_marks_and_saves_the_row_under_the_pointer() {
+    use super::tuning::{self, CapsuleFlow};
+    let always = |rt: &Runtime<CapsuleState>| -> Vec<String> {
+        let Pres::Done(super::flow::Done {
+            open: Some((_, list)),
+            ..
+        }) = &rt.state.surface.pres
+        else {
+            panic!("no list in {:?}", rt.state.surface.pres);
+        };
+        list.rows()
+            .filter(|dest| dest.why == "always")
+            .map(|dest| dest.name.clone())
+            .collect()
+    };
+    tuning::with_flow(CapsuleFlow::List, || {
+        for search in [false, true] {
+            let mut inputs = vec![processing_input(), Input::Routed(guess())];
+            if search {
+                inputs.push(Input::OpenList);
+            }
+            let (mut rt, actions) = live(inputs);
+            point_at(&mut rt, "row-HOME");
+            tap(&mut rt, Input::Shift(true));
+            assert_eq!(always(&rt), ["HOME"], "search: {search}");
+            point_at(&mut rt, "row-RUNE");
+            assert_eq!(always(&rt), ["RUNE"], "search: {search}");
+            click_on(&mut rt, "row-RUNE", 0);
+            assert_eq!(
+                *actions.lock().unwrap(),
+                [Action::Send {
+                    to: "RUNE".into(),
+                    always: Some("problems.kitlangton.com".into())
+                }],
+                "search: {search}"
+            );
+        }
+    });
 }
 
 fn processing_input() -> Input {

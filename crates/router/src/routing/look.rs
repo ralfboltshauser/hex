@@ -16,6 +16,8 @@ use crate::opencode::{
     ApiGet, OpenCodeSession, Scan, find_root_session, get_session, normalize_slug, query_escape,
 };
 
+mod read;
+
 /// Pages of newest root sessions read (100 each), besides the exact-folder and by-ID reads.
 pub const SESSION_PAGES: usize = 2;
 /// OpenCode Desktop counts as showing the session viewed last if that was this recently.
@@ -99,45 +101,76 @@ pub fn look_live_by(
     deadline: Instant,
     senses: &Senses,
 ) -> Live {
+    look_live_observed(front, target, pid, deadline, senses, |_| {})
+}
+
+/// Publishes the locally read URL before any session or page result is needed.
+pub fn look_live_observed(
+    front: Option<&str>,
+    target: Option<&str>,
+    pid: Option<i32>,
+    deadline: Instant,
+    senses: &Senses,
+    observed: impl FnOnce(Option<&str>),
+) -> Live {
+    let started = Instant::now();
     let left = || deadline.saturating_duration_since(Instant::now());
-    let url = (senses.tab)(front, target);
-    let mut clues = url
-        .as_deref()
-        .filter(|_| !left().is_zero())
-        .map(|url| url_clues(url, senses, true))
-        .unwrap_or_default();
-    if super::jev::enabled()
-        && let Some(exe) = pid.and_then(senses.executable)
-    {
-        clues.extend(dev_build_clue(target.or(front), &exe));
-    }
-    // Read beside the sessions, so its folder's and session's are read too.
-    clues.extend(target.and_then(|id| app_rule_clue(id, &(senses.apps)())));
-    if let Some((cwd, title)) = [front, target]
-        .into_iter()
-        .flatten()
-        .filter(|_| !left().is_zero())
-        .find_map(|id| (senses.terminal)(id))
-    {
-        clues.push(Clue::new(
-            Source::Terminal,
-            Pointer::Folder(folder_of(&cwd)),
-            format!("the terminal's focused pane is in {}", cwd.display()),
-        ));
-        let title_words = words(&title);
-        if !title_words.is_empty() {
-            clues.push(Clue::new(
-                Source::Title,
-                Pointer::Words { words: title_words },
-                format!("{TERMINAL_TITLE} \"{title}\""),
-            ));
+    let mut url = None;
+    let mut clues = Vec::new();
+    let mut local = Duration::ZERO;
+    let Read {
+        mut candidates,
+        error,
+    } = read::while_looking(senses.hooks.api, left().min(super::LOOK_BUDGET), || {
+        url = (senses.tab)(front, target);
+        observed(url.as_deref());
+        clues = url
+            .as_deref()
+            .filter(|_| !left().is_zero())
+            .map(|url| url_clues(url, senses, true))
+            .unwrap_or_default();
+        if super::jev::enabled()
+            && let Some(exe) = pid.and_then(senses.executable)
+        {
+            clues.extend(dev_build_clue(target.or(front), &exe));
         }
-    }
-    let (mut candidates, error) =
-        read_with(&clues, None, &[], left().min(super::LOOK_BUDGET), senses);
+        // Read beside the sessions, so its folder's and session's are read too.
+        clues.extend(target.and_then(|id| app_rule_clue(id, &(senses.apps)())));
+        if let Some((cwd, title)) = [front, target]
+            .into_iter()
+            .flatten()
+            .filter(|_| !left().is_zero())
+            .find_map(|id| (senses.terminal)(id))
+        {
+            clues.push(Clue::new(
+                Source::Terminal,
+                Pointer::Folder(folder_of(&cwd)),
+                format!("the terminal's focused pane is in {}", cwd.display()),
+            ));
+            let title_words = words(&title);
+            if !title_words.is_empty() {
+                clues.push(Clue::new(
+                    Source::Title,
+                    Pointer::Words { words: title_words },
+                    format!("{TERMINAL_TITLE} \"{title}\""),
+                ));
+            }
+        }
+        local = started.elapsed();
+        targets(&clues, None, &[])
+    });
+    let error = read_error(error, candidates.is_empty());
+    let looked = started.elapsed();
     if !left().is_zero() {
         look_at_page(url.as_deref(), &mut clues, &mut candidates, senses);
     }
+    crate::env::log(format!(
+        "routing time: look local_ms={} lookup_ms={} page_ms={} candidates={}",
+        local.as_millis(),
+        looked.as_millis(),
+        started.elapsed().saturating_sub(looked).as_millis(),
+        candidates.len()
+    ));
     Live {
         url,
         clues,
@@ -146,14 +179,15 @@ pub fn look_live_by(
     }
 }
 
-/// How long finding a page's publisher may spend on OpenCode's API (resolving a marker's
-/// subagent session to its root, reading sessions not read yet).
+/// How long finding a page's publisher may spend on OpenCode's API (reading sessions not read
+/// yet).
 const PUBLISHER_BUDGET: Duration = Duration::from_secs(1);
 
 /// When the server behind the tab serves the page from outside its own project (a shared
 /// artifact gallery), or runs inside a folder sessions publish into (`served::content_root`),
 /// the port's clue drops (to [`served::SERVER_ONLY`] or [`served::SERVER_IN_CONTENT`]) and the
-/// page's files give the clues instead: who published them, and the words of their path.
+/// page's files give the clues instead: the session the page names, else who published them,
+/// and the words of their path.
 /// Sessions those name that weren't read are added to `candidates`. Does nothing twice.
 pub fn look_at_page(
     url: Option<&str>,
@@ -161,10 +195,12 @@ pub fn look_at_page(
     candidates: &mut Vec<Candidate>,
     senses: &Senses,
 ) {
-    if clues
-        .iter()
-        .any(|c| matches!(c.source, Source::Publisher | Source::Document))
-    {
+    if clues.iter().any(|c| {
+        matches!(
+            c.source,
+            Source::Signed | Source::Publisher | Source::Document
+        )
+    }) {
         return;
     }
     let Some(port) = clues
@@ -228,19 +264,16 @@ pub fn look_at_page(
     };
     let mut api = super::within(senses.hooks.api, PUBLISHER_BUDGET);
     let mut found = Vec::new();
+    // A page names the session that asked for its captures, a subagent's included.
     if let Some((id, how)) = served::marker(&page) {
-        let id = root_session(&mut api, &id);
-        found.push(
-            Clue::new(
-                Source::Publisher,
-                Pointer::Session {
-                    id,
-                    directory: None,
-                },
-                how,
-            )
-            .worth(served::MARKED),
-        );
+        found.push(Clue::new(
+            Source::Signed,
+            Pointer::Session {
+                id,
+                directory: None,
+            },
+            how,
+        ));
     } else if let (Some(needle), Some((from, to))) = (page.needle(), served::window(&changed)) {
         found.extend(served::writer_clues(
             &changed,
@@ -264,19 +297,6 @@ pub fn look_at_page(
     clues.extend(found);
 }
 
-/// The root session of `id` (a subagent's session names its parent), or `id` when that can't
-/// be read.
-fn root_session(get: &mut ApiGet, id: &str) -> String {
-    let mut current = id.to_owned();
-    for _ in 0..5 {
-        let Some(parent) = get_session(get, &current).ok().and_then(|s| s.parent_id) else {
-            break;
-        };
-        current = parent;
-    }
-    current
-}
-
 /// Reads the sessions the clues and address could name, within [`super::LOOK_BUDGET`].
 pub(crate) fn read_for(
     clues: &[Clue],
@@ -294,6 +314,17 @@ pub(crate) fn read_with(
     budget: Duration,
     senses: &Senses,
 ) -> (Vec<Candidate>, Option<String>) {
+    let (roots, ids) = targets(clues, address, also);
+    let Read { candidates, error } = read::parallel(senses.hooks.api, &roots, &ids, budget);
+    let error = read_error(error, candidates.is_empty());
+    (candidates, error)
+}
+
+fn targets(
+    clues: &[Clue],
+    address: Option<&Address>,
+    also: &[String],
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut roots = Vec::new();
     let mut ids = Vec::new();
     for clue in clues {
@@ -305,16 +336,17 @@ pub(crate) fn read_with(
     }
     ids.extend(address.map(|a| a.session().to_owned()));
     ids.extend(also.iter().cloned());
-    let mut api = super::within(senses.hooks.api, budget);
-    let Read { candidates, error } = read_candidates(&mut api, &roots, &ids, SESSION_PAGES);
-    let error = error.map(|err| {
-        if candidates.is_empty() {
+    (roots, ids)
+}
+
+fn read_error(error: Option<anyhow::Error>, empty: bool) -> Option<String> {
+    error.map(|err| {
+        if empty {
             format!("couldn't list sessions: {err:#}")
         } else {
             format!("couldn't list every session: {err:#}")
         }
-    });
-    (candidates, error)
+    })
 }
 
 /// The clues a tab gives: its `/sdk.js` registration, and the folder of the process serving
@@ -505,6 +537,7 @@ pub fn replay(saved: Evidence, bundle: &ScrawlBundle, apps: &[(String, PathBuf)]
         .into_iter()
         .filter(|clue| match clue.source {
             Source::Rule
+            | Source::Signed
             | Source::DevBuild
             | Source::Page
             | Source::Port
@@ -904,6 +937,15 @@ pub fn evidence_for_bundle(
         if let Some(clue) = url.as_deref().and_then(|url| rule_clue(url, senses)) {
             evidence.clues.insert(0, clue);
         }
+        // A send a rule settled saved only the rule: the port is read now, so the page is too.
+        if !evidence.clues.iter().any(|c| c.source == Source::Port) {
+            evidence.clues.extend(
+                url.as_deref()
+                    .into_iter()
+                    .flat_map(|url| url_clues(url, senses, true))
+                    .filter(|c| c.source == Source::Port),
+            );
+        }
         look_at_page(
             url.as_deref(),
             &mut evidence.clues,
@@ -1218,8 +1260,9 @@ mod tests {
     struct World {
         reg: Option<Registration>,
         listeners: Vec<(u16, PathBuf)>,
-        sessions: Vec<crate::opencode::OpenCodeSession>,
     }
+
+    static WORLD_SESSIONS: OnceLock<Vec<crate::opencode::OpenCodeSession>> = OnceLock::new();
 
     thread_local! {
         static WORLD: std::cell::RefCell<World> = std::cell::RefCell::default();
@@ -1241,8 +1284,7 @@ mod tests {
         })
     }
     fn world_api(path: &str, _: Duration) -> Result<Vec<u8>> {
-        let sessions = WORLD.with(|w| w.borrow().sessions.clone());
-        crate::opencode::fake_api::serve(&sessions, path)
+        crate::opencode::fake_api::serve(WORLD_SESSIONS.get().unwrap(), path)
     }
     fn world_own_port(url: &WebUrl) -> Option<u16> {
         Some(url.port)
@@ -1260,7 +1302,10 @@ mod tests {
         std::fs::create_dir_all(repo.join("site")).unwrap();
         let repo_s = repo.to_string_lossy().into_owned();
         let site_s = repo.join("site").to_string_lossy().into_owned();
-        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        let home = crate::user_dirs::home_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
 
         let reg = |origin: &str, session: Option<&str>, directory: Option<&str>| Registration {
             origin: origin.into(),
@@ -1295,7 +1340,6 @@ mod tests {
                         Some("/p/app"),
                     )),
                     listeners: vec![(5173, "/p/app".into())],
-                    ..World::default()
                 },
             ),
             (
@@ -1317,7 +1361,6 @@ mod tests {
                 World {
                     reg: Some(reg("http://localhost:4321", None, Some("/p/none"))),
                     listeners: vec![(4321, "/p/app".into())],
-                    ..World::default()
                 },
             ),
             (
@@ -1325,7 +1368,6 @@ mod tests {
                 World {
                     reg: Some(reg("http://localhost:4321", None, None)),
                     listeners: vec![(4321, "/p/app".into())],
-                    ..World::default()
                 },
             ),
             (
@@ -1384,9 +1426,9 @@ mod tests {
             terminal: no_terminal,
             ..Senses::default()
         };
+        WORLD_SESSIONS.set(sessions).unwrap();
         let mut sent = 0;
-        for (url, mut world) in cases {
-            world.sessions = sessions.clone();
+        for (url, world) in cases {
             WORLD.with(|w| *w.borrow_mut() = world);
             let today = super::super::route(url, &senses.hooks).ok();
             let clues = url_clues(url, &senses, false);
@@ -1717,8 +1759,12 @@ mod tests {
             Some("https://studio.example.ts.net:4948/")
         );
         assert!(live.clues.is_empty(), "the tab came too late to look into");
-        assert!(live.candidates.is_empty());
-        assert!(live.error.unwrap().contains("couldn't list sessions"));
+        assert_eq!(
+            live.candidates.len(),
+            2,
+            "the list starts before the slow tab"
+        );
+        assert!(live.error.is_none());
     }
 
     #[test]
@@ -1767,7 +1813,7 @@ mod tests {
 
     #[test]
     fn an_always_rule_makes_its_sites_next_capture_a_saved_rule() {
-        use super::super::policy::saved_rule;
+        use super::super::policy::explicit;
         use super::super::smart::{Decision, Policy, decide};
         let senses = Senses {
             hooks: Hooks {
@@ -1795,7 +1841,7 @@ mod tests {
             decide(&evidence, Policy::Weigh).decision
         };
         assert!(
-            !matches!(judge(), Decision::Send { ref to, .. } if saved_rule(to)),
+            !matches!(judge(), Decision::Send { ref to, .. } if explicit(to)),
             "nothing the person saved covers the site yet"
         );
         // "Always send board.example.com here", as the capsule saves it (to the session
@@ -1812,7 +1858,7 @@ mod tests {
             panic!("the saved rule names the session");
         };
         assert_eq!(to.candidate.id, "ses_board");
-        assert!(saved_rule(&to));
+        assert!(explicit(&to));
     }
 
     // MARK: Pages from a file server
@@ -1939,7 +1985,8 @@ mod tests {
         }
     }
 
-    /// A page that names its session (a subagent's, here) goes there, whatever the history says.
+    /// A page that names its session (a subagent's, here) goes to that session, not its parent,
+    /// whatever the history says.
     #[test]
     fn a_marked_page_names_its_publisher() {
         fn api(path: &str, _: Duration) -> Result<Vec<u8>> {
@@ -1991,8 +2038,88 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         let judgement = decide(&evidence, Policy::Weigh);
         match &judgement.decision {
-            Decision::Send { to, .. } => assert_eq!(to.candidate.id, HEX),
+            Decision::Send { to, .. } => assert_eq!(to.candidate.id, "ses_child"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    thread_local! {
+        static GALLERY: std::cell::RefCell<PathBuf> = std::cell::RefCell::default();
+    }
+
+    /// A `routing.sites` rule for a whole gallery host once sent pages a session had signed to
+    /// another session. The gallery runs in a repository whose
+    /// `artifacts` folder is a symlink to another disk, so the page wasn't found either.
+    #[cfg(unix)]
+    #[test]
+    fn a_signed_page_beats_a_rule_for_its_whole_host() {
+        use super::super::policy::explicit;
+        fn gallery(port: u16) -> Option<PathBuf> {
+            (port == 8444).then(|| GALLERY.with(|g| g.borrow().clone()))
+        }
+        fn host_rule() -> Vec<(String, PathBuf)> {
+            vec![(
+                "https://studio.example.ts.net:8444".into(),
+                PathBuf::from("ses_ruled"),
+            )]
+        }
+        fn down(_: &str, _: Duration) -> Result<Vec<u8>> {
+            anyhow::bail!("no server in tests")
+        }
+        let base =
+            std::env::temp_dir().join(format!("scrawl-signed-{}", crate::util::make_bundle_id()));
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let server = home.join("tools/gallery");
+        std::fs::create_dir_all(&server).unwrap();
+        let disk = base.join("disk/artifacts");
+        let page = disk.join("2026-01-02-demo/examples/queue/index.html");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(
+            &page,
+            r#"<head><meta name="opencode-session" content="ses_signer"></head>"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&disk, home.join("artifacts")).unwrap();
+        GALLERY.with(|g| *g.borrow_mut() = server.clone());
+        let senses = Senses {
+            hooks: Hooks {
+                sdk: no_sdk,
+                listener_dir: gallery,
+                api: down,
+            },
+            tab: |_, _| None,
+            own_port: tailnet,
+            terminal: no_terminal,
+            servers: Vec::new,
+            sites: host_rule,
+            apps: Vec::new,
+            aliases: Vec::new,
+            writes: |_, _, _| Vec::new(),
+            executable: |_| None,
+        };
+        let url = "https://studio.example.ts.net:8444/2026-01-02-demo/examples/queue/";
+        let mut clues = url_clues(url, &senses, true);
+        assert!(clues.iter().any(|c| c.source == Source::Rule));
+        let mut candidates = Vec::new();
+        look_at_page(Some(url), &mut clues, &mut candidates, &senses);
+        std::fs::remove_dir_all(base).unwrap();
+        let evidence = Evidence {
+            clues,
+            candidates,
+            address: None,
+            now_ms: 0,
+            url: Some(url.into()),
+            sessions_error: None,
+        };
+        let judgement = decide(&evidence, Policy::Weigh);
+        let text = explain(&evidence, &judgement);
+        match &judgement.decision {
+            Decision::Send { to, .. } => {
+                assert_eq!(to.candidate.id, "ses_signer", "{text}");
+                assert!(explicit(to), "{text}");
+            }
+            other => panic!("{other:?}\n{text}"),
         }
     }
 

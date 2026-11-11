@@ -110,6 +110,7 @@ impl Backend {
                 transcription: published.transcription.clone(),
                 update_status: published.update_status.clone(),
                 update_notes: published.update_notes.clone(),
+                update_blocked: published.update_blocked,
                 editing: false,
             },
             settings: published.settings.clone(),
@@ -218,6 +219,16 @@ pub(super) fn validate_hotkey(
 ) -> Result<(), &'static str> {
     if target != ShortcutTarget::Dictation && binding.key.is_none() {
         return Err(tr("Add a key"));
+    }
+    // Hex takes the cancel key only while a recording runs, so a key alone,
+    // such as Escape, never keeps it from other apps.
+    if target == ShortcutTarget::Cancel {
+        return WindowsHotkey::from(binding)
+            .key
+            .as_deref()
+            .map_or(Ok(0), crate::windows::input::virtual_key)
+            .map(|_| ())
+            .map_err(|_| tr("Unsupported key"));
     }
     WindowsHotkey::from(binding)
         .validate()

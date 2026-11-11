@@ -45,6 +45,14 @@ pub(crate) trait Host {
         raw: bool,
     ) -> Result<(), ControlError>;
     fn paste_last(&self) -> Result<(), ControlError>;
+    /// Runs the focused field's text through its Output steps and replaces
+    /// it, where this OS has Labs › Transform typed text.
+    fn typed_text(&self) -> Result<(), ControlError> {
+        Err(ControlError::new(
+            "unsupported",
+            "Transform typed text is Linux only",
+        ))
+    }
     /// Saves `settings` as the window would and lets the runtime, the
     /// listener, and an open window adopt them.
     fn save(&self, settings: AppSettings) -> Result<(), ControlError>;
@@ -147,6 +155,10 @@ fn command(host: &dyn Host, command: ControlCommand) -> ControlReply {
             host.paste_last()
                 .map(|()| ControlReply::done("Pasting the last dictation")),
         ),
+        ControlCommand::TypedText => reply(
+            host.typed_text()
+                .map(|()| ControlReply::done("Transforming the focused text")),
+        ),
         ControlCommand::MeetingRecord { title } => meeting(false, title),
         ControlCommand::MeetingStop => meeting(true, None),
         ControlCommand::MeetingCopyLast => match crate::meeting::runtime::copy_last_transcript() {
@@ -233,6 +245,10 @@ fn command(host: &dyn Host, command: ControlCommand) -> ControlReply {
                 Ok(reply)
             }))
         }
+        ControlCommand::Screenshot { .. } => reply(Err(ControlError::new(
+            "unsupported",
+            "screenshots are macOS only",
+        ))),
         command @ (ControlCommand::ScrawlCapture { .. }
         | ControlCommand::ScrawlCaptureList { .. }
         | ControlCommand::ScrawlCaptureShow { .. }
@@ -247,6 +263,7 @@ fn dictation_message(action: CaptureAction) -> &'static str {
         CaptureAction::Start => "Starting dictation",
         CaptureAction::Stop => "Stopping dictation",
         CaptureAction::Toggle => "Toggling dictation",
+        CaptureAction::Cancel => "Cancelling dictation",
     }
 }
 
@@ -544,7 +561,12 @@ fn status(host: &dyn Host) -> Result<ControlReply, ControlError> {
         memory_footprint_bytes: super::memory_footprint(),
         listener: ListenerReport {
             running: state.listener.running,
-            status: match &state.listener.warning {
+            status: match state
+                .listener
+                .notice
+                .as_ref()
+                .or(state.listener.warning.as_ref())
+            {
                 Some(warning) => format!("{} ({warning})", state.listener.status),
                 None => state.listener.status.clone(),
             },
@@ -617,8 +639,11 @@ mod tests {
                 settings: AppSettings::default(),
                 listener: DesktopListenerSnapshot {
                     running: true,
+                    warming: false,
                     status: "Enabled".into(),
                     warning: None,
+                    notice: None,
+                    last_failure: None,
                     shortcuts: Default::default(),
                     shortcuts_configurable: false,
                 },
@@ -722,7 +747,7 @@ mod tests {
     fn a_printing_stop_answers_with_the_transcript() {
         let host = FakeHost::default();
         let stop = |print| ControlCommand::Dictation {
-            action: CaptureAction::Stop.into(),
+            action: CaptureAction::Stop,
             print,
             raw: false,
         };
@@ -734,7 +759,7 @@ mod tests {
         );
         assert_eq!(code(&ask(&host, stop(false))), "ok");
         let start_print = ControlCommand::Dictation {
-            action: CaptureAction::Start.into(),
+            action: CaptureAction::Start,
             print: true,
             raw: false,
         };
@@ -750,6 +775,7 @@ mod tests {
         let host = FakeHost::default();
         for command in [
             ControlCommand::LaunchAtLogin { enabled: None },
+            ControlCommand::TypedText,
             ControlCommand::ScrawlCaptureUndo,
             ControlCommand::WindowStory {
                 story: "HUD".into(),

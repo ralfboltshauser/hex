@@ -142,6 +142,7 @@ impl Backend {
                 transcription: published.transcription.clone(),
                 update_status: published.update_status.clone(),
                 update_notes: published.update_notes.clone(),
+                update_blocked: None,
                 editing: false,
             },
             settings: published.settings.clone(),
@@ -175,7 +176,12 @@ impl ChordWatch {
         let block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
             // SAFETY: AppKit passes a live event for the handler's duration.
             let event_ref = unsafe { event.as_ref() };
-            let flags = event_ref.modifierFlags().bits() as u64;
+            // NSEvent's flags carry the same device-dependent side bits, and
+            // macOS's filter can rewrite a remapped Caps Lock there too.
+            let flags = crate::app_settings::normalized_modifier_flags(
+                event_ref.modifierFlags().bits() as u64,
+                crate::suppression::physical_keys::snapshot(),
+            );
             let chord = match event_ref.r#type() {
                 NSEventType::KeyDown => {
                     let characters = event_ref
@@ -298,7 +304,7 @@ impl ChordCapture {
             Ok(key) => key,
             Err(message) => return Some(Chord::Captured(Err(message))),
         };
-        if modifiers.is_empty() && !is_function_key(&key.label) {
+        if modifiers.is_empty() && !is_function_key(&key.label) && !is_navigation_key(code) {
             return Some(Chord::Captured(Err(tr("Add a modifier"))));
         }
         Some(Chord::Captured(Ok(HotkeyBinding {
@@ -341,6 +347,13 @@ fn is_function_key(label: &str) -> bool {
         .strip_prefix('F')
         .and_then(|number| number.parse::<u8>().ok())
         .is_some_and(|number| (1..=20).contains(&number))
+}
+
+/// Home, End, Page Up, Page Down, and Help (Insert on PC keyboards): keys
+/// that type nothing, so, like a function key, one may be a shortcut alone,
+/// as it could before (#1138).
+fn is_navigation_key(code: u16) -> bool {
+    matches!(code, 115 | 119 | 116 | 121 | 114)
 }
 
 /// The key a virtual key code records, and its label.
@@ -455,18 +468,29 @@ pub(super) fn hotkey_key_named(name: &str) -> Result<HotkeyKey, &'static str> {
 }
 
 /// macOS accepts every binding the capture can produce, except that Paste
-/// Last fires only on a key press (`suppression::paste_action`), and the
-/// capture shortcut, pressed once to start and again to finish, and the
+/// Last and the screenshot shortcut fire only on a key press
+/// (`suppression::paste_action`), and the capture shortcut, pressed once to start and again to finish, and the
 /// send-to list's need a key.
 pub(super) fn validate_hotkey(
     target: ShortcutTarget,
     binding: &HotkeyBinding,
 ) -> Result<(), &'static str> {
-    if target == ShortcutTarget::PasteLast && binding.key.is_none() {
+    if matches!(
+        target,
+        ShortcutTarget::PasteLast
+            | ShortcutTarget::Cancel
+            | ShortcutTarget::Screenshot
+            | ShortcutTarget::ScreenshotRecord
+    ) && binding.key.is_none()
+    {
         return Err(tr("Add a key"));
     }
     #[cfg(hex_capture)]
-    if target == ShortcutTarget::Capture && binding.key.is_none() {
+    if matches!(
+        target,
+        ShortcutTarget::Capture | ShortcutTarget::CaptureReplay
+    ) && binding.key.is_none()
+    {
         return Err(tr("Add a key"));
     }
     Ok(())
@@ -630,6 +654,9 @@ impl MacHost {
             MeetingRequest::Stop => self
                 .runtime()?
                 .meeting(crate::meeting::MeetingRequest::Stop),
+            MeetingRequest::Import(path) => self
+                .runtime()?
+                .meeting(crate::meeting::MeetingRequest::Import(path)),
             MeetingRequest::Summarize(id) => self
                 .runtime()?
                 .meeting(crate::meeting::MeetingRequest::Summarize(id)),
@@ -639,9 +666,13 @@ impl MacHost {
             MeetingRequest::Trash(id) => {
                 crate::meeting::trash(&id).map_err(|error| format!("{error:#}"))
             }
-            MeetingRequest::Reveal(id) => {
-                let root = crate::meeting::root().map_err(|error| format!("{error:#}"))?;
-                open_path(&root.join(id));
+            MeetingRequest::Reveal(target) => {
+                if target.is_markdown() {
+                    // `open -R` selects the exported Markdown in Finder.
+                    crate::meeting::reveal(target.path());
+                } else {
+                    open_path(target.path());
+                }
                 Ok(())
             }
             MeetingRequest::RevealFolder => {
@@ -1226,8 +1257,8 @@ impl ScrawlHost {
     fn send(&mut self, request: super::platform::ScrawlRequest) {
         use super::platform::ScrawlRequest;
         match request {
-            // `send` moves the next refresh to now.
-            ScrawlRequest::Refresh => {}
+            // The pane opened or the window became key: read now.
+            ScrawlRequest::Refresh => crate::capture_host::invalidate_screen_access(),
             ScrawlRequest::QuitScrawl => crate::capture_host::quit_scrawl(),
             ScrawlRequest::RevealFolder => {
                 let folder = crate::app_settings::capture_settings().captures_dir();
@@ -1278,7 +1309,16 @@ impl ScrawlHost {
         if !(refresh || changed) {
             return changed;
         }
-        let screen = crate::capture_host::screen_access();
+        // The row on screen follows the grant within seconds; without it an
+        // idle read stands, so no helper runs just because a window polls.
+        let screen = if state
+            .permissions_shown
+            .contains(&PermissionKind::ScreenRecording)
+        {
+            crate::capture_host::screen_access_watched()
+        } else {
+            crate::capture_host::screen_access()
+        };
         let screen_recording = screen == crate::capture_host::ScreenAccess::Allowed;
         let needs_restart = screen == crate::capture_host::ScreenAccess::NeedsRestart;
         changed |= update(&mut view.screen_needs_restart, needs_restart);
@@ -1641,6 +1681,24 @@ mod tests {
         let f12 = captured(capture.key_down(111, false, None, FUNCTION)).unwrap();
         assert!(f12.modifiers.is_empty());
         assert_eq!(f12.key.unwrap().label, "F12");
+        // Issue 1138: End, and the other keys that type nothing, record alone.
+        for (code, label) in [
+            (119, "End"),
+            (115, "Home"),
+            (116, "Page Up"),
+            (121, "Page Down"),
+            (114, "Help"),
+        ] {
+            let binding = captured(capture.key_down(code, false, None, FUNCTION)).unwrap();
+            assert!(binding.modifiers.is_empty());
+            assert_eq!(binding.key.as_ref().unwrap().label, label);
+            assert!(binding.runtime().matches_key_press(code, FUNCTION));
+        }
+        assert_eq!(
+            captured(capture.key_down(123, false, None, FUNCTION)),
+            Err(tr("Add a modifier")),
+            "arrows still need one"
+        );
         assert!(matches!(
             capture.key_down(ESCAPE_KEY_CODE, false, None, 0),
             Some(Chord::Cancelled)

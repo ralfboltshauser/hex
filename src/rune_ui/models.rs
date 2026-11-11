@@ -1,8 +1,9 @@
 //! The OpenCode model catalog and the model and thinking pickers that each
-//! mode's rewriting uses: the catalog loads off the UI thread only while
-//! the Modes pane shows, a stopped OpenCode is looked for again at a coarse
-//! interval, failures wait for an explicit retry, and choosing a model also
-//! picks its recommended thinking variant.
+//! mode's rewriting uses, and Meetings › Settings' summary model picker:
+//! the catalog loads off the UI thread only while a pane that uses it shows,
+//! a stopped OpenCode is looked for again at a coarse interval, failures
+//! wait for an explicit retry, and choosing a mode's model also picks its
+//! recommended thinking variant.
 
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
@@ -30,7 +31,15 @@ const MODEL_FIELD_WIDTH: f32 = 240.0;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Target {
     Mode(Selection),
+    /// `meetings.opencode_model` (Meetings › Settings › Summaries): no
+    /// thinking variant, and its default entry clears it, so Hex picks one
+    /// of its fast models.
+    MeetingSummary,
 }
+
+/// The meeting summary picker's default entry, and the field while it is
+/// chosen.
+pub(super) const SUMMARY_AUTOMATIC: &str = "Hex picks a fast model";
 
 pub(super) struct Models {
     state: ModelCatalogState,
@@ -39,6 +48,9 @@ pub(super) struct Models {
     retry_at: Option<Instant>,
     /// The model popover: open, its search, and its highlight.
     pub(super) picker: ComboboxState,
+    /// Whether the popover was open at the last poll, so opening it reads
+    /// the catalog again.
+    picker_was_open: bool,
 }
 
 impl Default for Models {
@@ -48,6 +60,7 @@ impl Default for Models {
             receiver: None,
             retry_at: None,
             picker: ComboboxState::default(),
+            picker_was_open: false,
         }
     }
 }
@@ -62,14 +75,22 @@ impl Models {
     /// field does.
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn open_picker(&mut self) {
-        self.picker.open = true;
-        self.picker.search.focused = true;
+        let _ = self
+            .picker
+            .step(rune_kit::ComboboxEvent::Toggle { current: None });
     }
 
     /// Adopts a finished load. While `wanted` (a pane that uses the catalog
     /// shows), loads it the first time and looks for a stopped OpenCode
     /// now and then; otherwise touches nothing.
     pub(super) fn poll(&mut self, wanted: bool) -> bool {
+        let opened = self.picker.is_open() && !self.picker_was_open;
+        self.picker_was_open = self.picker.is_open();
+        // Opening the picker reads the catalog again, keeping the models it
+        // shows until the new list arrives.
+        if wanted && opened && self.receiver.is_none() {
+            self.start_load();
+        }
         if let Some(receiver) = &self.receiver {
             let Ok(state) = receiver.try_recv() else {
                 return false;
@@ -179,9 +200,20 @@ impl Models {
 }
 
 fn selected(settings: &AppSettings, target: Target) -> (Option<&str>, Option<&str>) {
-    let Target::Mode(selection) = target;
-    let processing = &super::modes::mode(settings, selection).post_processing;
-    (processing.model.as_deref(), processing.variant.as_deref())
+    match target {
+        Target::Mode(selection) => {
+            let processing = &super::modes::mode(settings, selection).post_processing;
+            (processing.model.as_deref(), processing.variant.as_deref())
+        }
+        Target::MeetingSummary => (
+            settings
+                .meetings
+                .opencode_model
+                .as_deref()
+                .filter(|model| !model.trim().is_empty()),
+            None,
+        ),
+    }
 }
 
 fn set_model(
@@ -190,10 +222,14 @@ fn set_model(
     model: Option<String>,
     variant: Option<String>,
 ) {
-    let Target::Mode(selection) = target;
-    let processing = &mut super::modes::mode_mut(settings, selection).post_processing;
-    processing.model = model;
-    processing.variant = variant;
+    match target {
+        Target::Mode(selection) => {
+            let processing = &mut super::modes::mode_mut(settings, selection).post_processing;
+            processing.model = model;
+            processing.variant = variant;
+        }
+        Target::MeetingSummary => settings.meetings.opencode_model = model,
+    }
 }
 
 fn choose_model(ui: &mut Ui, target: Target, model: Option<String>) {
@@ -249,7 +285,18 @@ fn status(models: &Models) -> String {
 /// The model row (and the thinking row when the model has variants).
 pub(super) fn rows(ui: &Ui, p: Paint, target: Target, layer: &mut Vec<El>) -> Vec<El> {
     let (model, variant) = selected(&ui.settings, target);
-    let presentation = model_presentation(&ui.models.state, model);
+    let meeting = target == Target::MeetingSummary;
+    // Hex, not OpenCode's default, picks a meeting summary model left unset.
+    let presentation = if meeting && model.is_none() {
+        None
+    } else {
+        model_presentation(&ui.models.state, model)
+    };
+    let field_label = if meeting {
+        tr("Summary model")
+    } else {
+        tr("OpenCode model")
+    };
     let c = &p.k.c;
     let mut field = row()
         .key("model-value")
@@ -286,6 +333,14 @@ pub(super) fn rows(ui: &Ui, p: Paint, target: Target, layer: &mut Vec<El>) -> Ve
                     .is_default
                     .then(|| Badge::new(tr("Default")).build(p.k)),
             ),
+        None if meeting => field.child(
+            text(tr(SUMMARY_AUTOMATIC))
+                .key("name")
+                .font(p.k.ty.ui_medium)
+                .color(p.text())
+                .grow(1.0)
+                .truncate(),
+        ),
         None => field.child(
             text(tr("Search available models"))
                 .key("placeholder")
@@ -294,13 +349,16 @@ pub(super) fn rows(ui: &Ui, p: Paint, target: Target, layer: &mut Vec<El>) -> Ve
                 .grow(1.0),
         ),
     };
-    field = field.child(
-        rune::icon(p.k.glyph.chevron_down, 16.0)
-            .key("chevron")
-            .color(c.icon_muted),
-    );
+    field = field
+        .child(
+            rune::icon(p.k.glyph.chevron_down, 16.0)
+                .key("chevron")
+                .color(c.icon_muted),
+        )
+        .label(field_label);
     let picker = model_picker(ui, p, target, field, layer);
-    let refresh = ui.models.available().then(|| {
+    // The meeting picker reads the catalog again each time it opens instead.
+    let refresh = (!meeting && ui.models.available()).then(|| {
         button(
             p,
             "refresh-models",
@@ -315,6 +373,16 @@ pub(super) fn rows(ui: &Ui, p: Paint, target: Target, layer: &mut Vec<El>) -> Ve
         .center_y()
         .child(picker)
         .children(refresh);
+    if meeting {
+        let about = super::platform_settings::summary_model_problem(model.unwrap_or_default());
+        return vec![setting_row(
+            p,
+            "meeting-summary-model",
+            tr("Model"),
+            about,
+            control,
+        )];
+    }
     let description = status(&ui.models);
     let mut rows = vec![setting_row(
         p,
@@ -351,7 +419,9 @@ pub(super) fn rows(ui: &Ui, p: Paint, target: Target, layer: &mut Vec<El>) -> Ve
                 let variant = (choice != tr("Default")).then(|| choice.to_owned());
                 choose_variant(ui, target, variant);
             })
-            .build(p.k, layer);
+            .build(p.k, layer)
+            .label(tr("Thinking"))
+            .a11y_value(current.clone());
         rows.push(setting_row(
             p,
             "thinking",
@@ -371,7 +441,10 @@ fn model_picker(ui: &Ui, p: Paint, target: Target, field: El, layer: &mut Vec<El
     let mut keys = Vec::new();
     let mut options = Vec::new();
     if let Some(catalog) = catalog {
-        if let Some(name) = &catalog.default_name {
+        if target == Target::MeetingSummary {
+            keys.push(None);
+            options.push(ComboboxOption::new("0", tr(SUMMARY_AUTOMATIC)));
+        } else if let Some(name) = &catalog.default_name {
             keys.push(None);
             let mut option = ComboboxOption::new("0", tr("Use OpenCode default"));
             option.detail = name.clone();

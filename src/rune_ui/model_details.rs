@@ -1,8 +1,8 @@
 //! A catalog model's details in the Local transcription picker, for models
-//! whose licence or provenance needs more than the card (Parakeet Ultra):
-//! its languages, measured peak memory, the credit word for word with
-//! source and licence links, the publisher's notice, and a folded table of
-//! the publisher's own benchmarks, labelled as not measured in Hex.
+//! whose licence or provenance needs more than the card (Parakeet Ultra and
+//! Orukeet): its languages, measured peak memory, the credit word for word
+//! with source and licence links, the publisher's notice, and a folded table
+//! of the publisher's own benchmarks, labelled as not measured in Hex.
 
 use rune::{El, col, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize};
@@ -93,6 +93,8 @@ pub(super) fn section(ui: &Ui, p: Paint, model: &ModelDefinition) -> Option<El> 
     };
     let mut section = col()
         .key("details")
+        // Only a press guard: assistive technology reads its lines.
+        .role("none")
         .gap(6.0)
         .pt(4.0)
         // Reading the details never chooses the card's model.

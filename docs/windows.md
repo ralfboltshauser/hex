@@ -13,8 +13,10 @@ or user-defined TypeScript transformations.
 
 The default shortcut is `Ctrl+Space`. In **Hold** mode, hold both keys while
 speaking and release Space to transcribe and paste. In **Toggle** mode, press
-`Ctrl+Space` to start and again to finish. Escape never cancels (every
-dictation finishes and pastes), and holding a modifier on its own does nothing. Hex consumes the chord while it matches, so
+`Ctrl+Space` to start and again to finish, or press the **Cancel** shortcut
+(Escape by default) to throw the recording away; Hex takes that key only while
+a recording runs. Hold mode has no cancel (every dictation finishes and
+pastes), and holding a modifier on its own does nothing. Hex consumes the chord while it matches, so
 applications and input methods no longer see `Ctrl+Space`; rebind it in Settings
 if you rely on that chord elsewhere. To let another app use the same key, such as
 a Discord push-to-talk key, turn on **Share dictation shortcut with other apps**
@@ -41,20 +43,22 @@ updating itself from the Dev channel; afterwards, the stable release.
 
 [anoma.ly/hex](https://anoma.ly/hex/) picks the right one. The
 installer needs no administrator rights: it installs for the current user,
-adds Hex to the Start menu and to **Settings › Apps** for uninstalling, and
-opens Hex, whose first run downloads a speech model. Releases built once
+adds Hex to the Start menu, to **Settings › Apps** for uninstalling, and
+`hex` to PATH for terminals, and opens Hex, whose first run downloads a speech
+model. Releases built once
 Anomaly's Azure Artifact Signing is configured are Authenticode-signed
 ([windows-signing.md](windows-signing.md)). Until then, and while a new
 publisher builds SmartScreen reputation, SmartScreen may say it protected your
 PC; choose **More info**, then **Run anyway**.
 
-**x64** decodes on the GPU through Vulkan and needs a current NVIDIA, AMD, or
-Intel graphics driver (it supplies `vulkan-1.dll`); the installer stops with an
-explanation when it is missing. **ARM64** decodes on the CPU. Both are
+**x64** decodes on the GPU through Vulkan 1.2, which a current NVIDIA, AMD, or
+Intel graphics driver supplies (`vulkan-1.dll`). With a missing or older
+driver Hex still starts and decodes on the CPU, and Settings › Speech engine
+says so. **ARM64** decodes on the CPU. Both are
 self-contained: no Visual C++ Redistributable is required. Hex then keeps
 itself current through the signed update feed. Uninstalling removes every
-installed version, the shortcut, and Launch at login, and keeps settings, logs,
-history, and models in `%APPDATA%\hex`.
+installed version, the shortcut, and Launch at login, and keeps settings and
+history in `%APPDATA%\hex` and logs and models in `%LOCALAPPDATA%\hex`.
 
 The installer and the script below create the same managed layout, so either
 can replace the other. For a scripted install:
@@ -64,6 +68,16 @@ powershell -ExecutionPolicy Bypass -Command "iwr https://anoma.ly/hex/files/inst
 ```
 
 Uninstall a script install with `install-windows.ps1 -Uninstall`.
+
+The managed layout is `%APPDATA%\hex\versions\<version>\` holding `hex.exe`,
+the app, a GUI program so launching Hex opens no console window, and
+`hex.com`, its console entry point, which runs `hex.exe` with the same
+arguments, waits for it, and returns its exit code (`hex` and `hex app` only
+start the app and return). Shortcuts, Launch at login,
+and the Start menu open `hex.exe`. `%APPDATA%\hex\bin\hex.com`, a copy that
+runs the version `current-version` names, is on the user's PATH, and a
+terminal resolves `hex` to it before any `hex.exe` because PATHEXT lists
+`.COM` first. Terminals opened before the install need reopening to see PATH.
 
 ## Known Issues
 
@@ -125,8 +139,8 @@ cargo run -- devices
 cargo run -- model devices
 ```
 
-Install the selected model (with Hex stopped, `model install` downloads in
-this process), load it, and transcribe a WAV file:
+Install the selected model (with Hex stopped, `model install` downloads and
+selects it in this process), load it, and transcribe a WAV file:
 
 ```powershell
 cargo run -- model install
@@ -169,11 +183,18 @@ cargo run -- listen --model parakeet_v3 --language pl
 Press Enter once to start, then again to stop. Captures shorter than 300 ms are
 discarded. `--device` accepts a case-insensitive fragment from `devices`.
 
-Runtime data is stored under `%APPDATA%\hex`. Observations are in
+Runtime data is stored under `%APPDATA%\hex`, except logs and speech models,
+which belong to this computer and live in `%LOCALAPPDATA%\hex`: on managed
+networks Windows copies the Roaming folder to a server at every sign-in, which
+hundreds of megabytes of models would slow down. An older Hex's `logs` and
+`models` move there once (`app_paths::machine_local`); while a running Hex
+holds them, the Roaming copy stays in use. Observations are in
 `logs\live.ndjson`, and native/runtime diagnostics are in `logs\process.log`,
 including every panic with its thread and backtrace. A worker that stops
-unexpectedly leaves its cause there. The app detaches from its console at
-launch, so it has no stdout or stderr.
+unexpectedly leaves its cause there. `hex.exe` is a GUI program, so a launch
+from Explorer, the Start menu, or login opens no console window. Run from a
+terminal, it prints startup errors there, then the app leaves the terminal and
+has no stdout or stderr.
 Successful pasted dictations are retained, subject to the selected retention
 window and hard size limits, in `history.json`. Captured audio is never retained
 by default.
@@ -247,8 +268,15 @@ hex app
   (its HWND through `WindowHandle::with_raw_handle`) for the taskbar,
   Alt-Tab, and the caption. The native title bar keeps its icon and title,
   blended into the window: DWM paints the caption the theme's `bg_deep`
-  (`DWMWA_CAPTION_COLOR`, Windows 11; Windows 10 keeps its own caption
-  color). The view repaints it when the system theme switches.
+  (`DWMWA_CAPTION_COLOR`; Windows 10 has no caption colour and keeps DWM's
+  own dark or light caption from `DWMWA_USE_IMMERSIVE_DARK_MODE`, and builds
+  before 19041 keep the OS caption) and draws its text and buttons in the
+  window's light or dark mode. The view re-applies both when the window's
+  theme changes, and a window subclass re-applies that caption after a
+  `WM_SETTINGCHANGE` while Appearance forces a theme different from the OS:
+  winit repaints the frame from the OS theme on each one, and only reports
+  `ThemeChanged` when the OS theme actually changed. The subclass removes
+  itself when the window is destroyed.
 - Without a tray (creation failed) closing the window quits Hex.
   See the [single-process plan](plans/single-process.md#windows-under-rune).
 
@@ -315,7 +343,7 @@ current-user startup registry, UI Automation, and Windows capture APIs.
 | Web-domain mode rules and browser context via UI Automation | Implemented; the page URL comes from the browser's UIA document element, bounded so a hung provider degrades to application-only context |
 | Managed installer with Start Menu integration and clean uninstall | Implemented as `.github/release/install-windows.ps1`; it creates the self-updating versions layout, and updates retarget the managed shortcut and Launch-at-login entry |
 | First-run onboarding | Implemented; a fresh install picks a dictation language, downloads its recommended model with live progress, and starts listening only once setup is recorded — the shared first-run story, with a Microphone page only while the privacy switch is off and the practice game on the real shortcut |
-| Activity pane with the live session and recent transcripts | Implemented in developer builds; the shared read-only pane |
+| Activity pane with the live session and recent dictations | Implemented in developer builds; the shared read-only pane (phases and timing; the event log keeps no dictated text) |
 | Developer Meetings, live drafts, and meeting paste | Missing |
 | Local transcription API and public TypeScript SDK host lifecycle on Windows | Missing; see Local Transcription Service |
 | Streaming finish with whole-clip fallback | Implemented on GPU devices with Parakeet Unified English |
@@ -330,7 +358,13 @@ through the same `dictation/processor` and `personal_commands` modules as
 macOS, and Windows reaches the running OpenCode service the same way: its
 registration file and loopback HTTP, never a CLI. Like macOS,
 an unset OpenCode model tries the ranked recommended models before the
-OpenCode default.
+OpenCode default. An OpenCode service running inside WSL2 is found only with
+Labs › OpenCode in WSL on: WSL2 forwards its loopback URL, and the lab adds
+the default distribution's registration and a Linux workspace path for
+`x-opencode-directory`. Annotate's capture sends use the same service: the
+prompt's "Recorded at" line names the capture folder as a Linux `/mnt/…` path
+while the summary header keeps the Windows path. Off, Hex reads only the
+Windows registration and an OpenCode in WSL isn't found.
 Remaining panes should be added only with their complete Windows behavior;
 empty look-alike screens do not count as parity.
 

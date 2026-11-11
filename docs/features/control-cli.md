@@ -12,6 +12,7 @@ Agent or terminal                                  // control.cli; every OS
 │   OS can't do it -> unsupported at runtime, exit 1
 ├── hex status [--json] -> Listener, capture, meeting, model, features,
 │   permissions, window, update, version, pid, memory
+│   ├── Wayland listener -> its warning names a missing wl-copy before paste fails
 │   └── Hex not running -> exit 3, "Hex is not running; run `hex start`"
 ├── hex start -> Already running: nothing | else open Hex.app (Linux and
 │   Windows: a detached `hex app --hidden`), wait ≤ 20 s
@@ -21,13 +22,14 @@ Agent or terminal                                  // control.cli; every OS
 │   ├── Listener didn't answer, no --force -> busy (it might be recording)
 │   └── restart -> reopens with the running Hex's HEX_* variables (macOS);
 │       Linux unit -> systemctl restart; else waits for the drain, then start
-├── hex dictation start|stop|toggle
+├── hex dictation start|stop|toggle|cancel
 │   ├── Same shortcut state machine as the hotkey; start locks the capture
 │   ├── start -> intentional at once: tone once the mic is open, recording
 │   │   behavior, live stream
 │   ├── stop -> done only when the clip went to transcription;
 │   │   no audio yet or silent -> discarded, nothing transcribing
-│   ├── cancel (an older `hex`) -> removed, exit 1: dictation has no cancel (#786)
+│   ├── cancel -> discards the recording in any mode, nothing pasted or saved;
+│   │   jobs already transcribing finish; idle -> unchanged
 │   ├── Repeat a command -> unchanged, exit 0
 │   └── dictation stop --print -> stops at once, then waits ≤ 60 s and prints
 │       the transcript (processed as a paste) instead of pasting it
@@ -41,6 +43,21 @@ Agent or terminal                                  // control.cli; every OS
 ├── hex paste-last -> pastes the last dictation
 │   ├── Setup gates the listener -> not-ready
 │   └── Recording or shortcut gesture in progress -> busy (menu bar: nothing)
+├── hex typed-text (Linux) -> the Transform typed text shortcut's one job
+│   ├── Labs › Transform typed text off -> disabled
+│   ├── Terminal paste on -> disabled (it would send Ctrl+Shift+V)
+│   ├── Setup gates the listener -> not-ready
+│   └── Recording, a pending start, or a capture still finishing -> done,
+│       but the listener drops the job: no keys are sent and no state changes
+├── hex transcribe <file> [--model <id>] [--language <code>]
+│   ├── Labs › Transcribe files off -> disabled, exit 1; the file is never read
+│   ├── Not WAV, or over 64 MiB -> refused here, before Hex is asked
+│   ├── Hex running -> the file to POST /transcriptions with the model named;
+│   │   ≤30 s runs on the dictation engine's model, longer clips on the
+│   │   transcription service's own copy; stdout gets the transcript
+│   ├── Hex stopped -> Linux/Windows load the model here as `model transcribe`;
+│   │   macOS answers not-running, exit 3
+│   └── No speech -> no-speech, exit 4; nothing pasted, kept, or processed
 ├── hex meetings record [--title] | stop | copy-last
 │   ├── Meetings off -> feature-off; recording shows in the menu bar and HUD
 │   │   exactly like a menu-bar recording
@@ -56,10 +73,12 @@ Agent or terminal                                  // control.cli; every OS
 │       └── Hex stopped -> written to settings.json under the service lock
 │           (Linux); a Hex holding it is waited for (≤ 35 s) instead
 ├── hex model list | use <id> | install [id] | cancel
-│   ├── use -> installed models only; never downloads or repairs; keeps the
-│   │   model's remembered language and hints (--language overrides)
-│   └── Linux/Windows: install with Hex stopped downloads here; status,
-│       devices, check, transcribe run here (macOS: unsupported)
+│   ├── use -> installed models only; needs the running Hex; never downloads
+│   │   or repairs; keeps the model's remembered language and hints
+│   │   (--language overrides)
+│   └── Linux/Windows: install with Hex stopped downloads and selects here
+│       (a Hex that starts meanwhile makes the switch); status, devices,
+│       check, transcribe run here (macOS: unsupported)
 ├── hex window show [pane] | hide
 │   ├── settings -> the General pane (status window.pane stays "settings")
 │   ├── meetings pane with Meetings off -> the pane's opt-in card
@@ -79,11 +98,22 @@ the local API's owner-only discovery file and the bearer-authenticated
 so they never compete with the running app for its files. Opt-ins stay
 explicit settings: no command turns Meetings on as a side effect.
 
+`hex transcribe` is the one command that doesn't use `/control`: it reads and
+checks the WAV here, then sends it to the same discovery file's
+`POST /transcriptions` (`Content-Type: audio/wav`, 64 MiB cap), so the running
+app transcribes it with the model the request names: a clip up to 30 s on its
+dictation engine's model when it holds that one, a longer clip on the
+transcription service's own copy. Its Labs toggle is read from
+`settings.json` (`AppSettings::read`), the same read `hex labs` lists from, so
+the check works with Hex running or stopped; a running Hex saves the toggle
+there at once. Off, nothing is read.
+
 On Linux and Windows `control::host::answer` carries every command out through
 the OS's adapter (`linux::app::LinuxControl`, `windows::rune::WindowsControl`):
-dictation and paste-last go to the listener's own queue (Windows: the same
-hotkey loop, as a toggle press would), settings save and reload as the
-window's do, and `settings set` refuses a key whose capability the OS lacks
+dictation, paste-last, and Linux's typed-text go to the listener's own queue
+(Windows: the same hotkey loop, as a toggle press would), settings save and
+reload as the window's do, and `settings set` refuses a key whose capability
+the OS lacks
 (`settings list` marks it "not on this OS"). `meetings record|stop|copy-last`
 go to the meeting recorder (`meeting/runtime`) as the tray's items do;
 `window story` answers `unsupported`; Windows sends every `annotate`
@@ -112,8 +142,8 @@ pins restart's; `macos_rune::control::tests` check that `model use` prepares
 its exact selection installed-only;
 `dictation::audio::tests::marked_captures_are_intentional_without_a_hold`
 covers the immediate stream and `ReadyIntentional`; `recognition::tests`
-cover the stop replies and the paste-last refusal; `control::tests::an_older_cancel_gets_removed`
-covers the `removed` reply; local API's
+cover the stop replies and the paste-last refusal; `control::tests::cancel_parses_and_takes_no_flags`
+covers `cancel` and its flags; local API's
 `control_requests_are_authenticated_versioned_and_typed` covers authentication,
 bounds, and error codes; `tests::control_commands_parse_beside_the_read_commands`
 covers parsing next to `history` and `meetings`; `control::host::tests` cover
@@ -121,7 +151,9 @@ the quit refusal, printing stops, and runtime `unsupported` replies;
 `linux::tests` parse the shared tree beside Linux's own commands;
 `rune_ui::platform::parity_tests` fail when a capability differs across OSes
 without a recorded reason; `settings_name_real_capabilities_and_keys` checks
-the settings-to-capability table.
+the settings-to-capability table; `control::cli::transcribe::tests` cover the
+lab-off refusal, a non-WAV file refused before any transcription, the selected
+model and language, and an empty transcript as `no-speech`.
 
 Observed (Oct 30, apollo, an isolated data root and `hex service` without a
 display): status, settings get/set (and refusing `show_dock_icon`), vocabulary
@@ -137,4 +169,7 @@ has no end-to-end test. A CLI volume change does not preview a tone as the windo
 permission prompts, calendar connection, and meeting deletion or renaming have
 no command. Linux and Windows dictation through the CLI has not run with a
 microphone, and meeting recording through the CLI has not run on Linux or
-Windows.
+Windows. `hex transcribe`'s gate-off refusal, its non-WAV refusal, and a
+running headless service's `model-unavailable` answer were observed on Linux;
+no model was installed, so its transcript answer was not observed end to end,
+and it has not run on macOS or Windows.

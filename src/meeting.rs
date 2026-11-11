@@ -11,15 +11,18 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::{Deserialize, Serialize};
 
-use crate::app_settings::MeetingRetention;
 use crate::desktop::events::now_ms;
 use crate::durable::{sync_directory, sync_file};
 
 const SAMPLE_RATE: u32 = 16_000;
 const TRANSCRIPT_TURN_GAP_MS: u64 = 3_000;
-/// Beside the manifest of a meeting Hex quit while recording: its audio is
+/// Beside the manifest of a meeting Hex quit while recording or during its
+/// final transcription: its audio is
 /// saved and its final transcript runs at the next launch.
 const FINAL_PENDING_FILE: &str = "final.pending";
+/// While an audio import runs, until final.pending exists: marks the folder
+/// as an import the launch sweep may remove once its lock is free.
+const IMPORT_PENDING_FILE: &str = "import.pending";
 
 mod capture;
 mod chapters;
@@ -34,6 +37,9 @@ mod os;
 #[cfg(target_os = "windows")]
 #[path = "meeting/windows.rs"]
 mod os;
+/// Linux's Trash, for capture retention too: distros ship no `trash` command.
+#[cfg(target_os = "linux")]
+pub(crate) use os::move_to_trash;
 pub(crate) use os::reveal;
 #[cfg(target_os = "macos")]
 pub(crate) use os::{
@@ -43,13 +49,24 @@ pub(crate) use os::{
 };
 mod delta;
 mod echo;
+mod export_name;
+mod finish;
+pub(crate) mod finished_events;
 pub(crate) mod generator;
+#[cfg(target_os = "macos")]
+pub(crate) mod import;
+#[cfg(any(target_os = "windows", test))]
+mod loopback_route;
 pub(crate) mod mcp;
 mod notes;
+mod notes_file;
 pub mod query;
+mod retention;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod runtime;
+pub(crate) mod sweep;
 mod transcript;
+mod warning;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod watcher;
 #[cfg(all(debug_assertions, target_os = "macos"))]
@@ -61,7 +78,11 @@ pub use delta::*;
 pub use notes::{MeetingNotes, display_title, notes_in_progress, notes_wanted, spawn_summary};
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub use notes::{summarize, summarize_file};
+#[cfg(test)]
+pub use retention::audio_expired;
+pub use retention::{expire, expire_audio, expired, retention_for};
 pub use transcript::TranscriptReader;
+pub use warning::TrackWarning;
 
 /// What the recorder knows about a meeting when it starts.
 #[derive(Clone, Debug, Default)]
@@ -70,6 +91,9 @@ pub struct MeetingStart {
     pub title: Option<String>,
     /// The detected call application, such as `Zoom`.
     pub app: Option<String>,
+    /// The call app's canonical bundle identifier, whose input the
+    /// microphone follows where the OS reports it.
+    pub application: Option<String>,
     /// The calendar event the recording was started for.
     pub calendar: Option<MeetingCalendar>,
     /// Where `title` came from; ignored without a title.
@@ -110,6 +134,9 @@ pub enum RecordingUpdate {
     Retitled { title: String },
     /// The live chapters so far (Labs).
     Chapters(Vec<Chapter>),
+    /// The microphone's captured audio became digitally silent, or its
+    /// audio returned.
+    SourceWarning { warning: Option<TrackWarning> },
     /// Capture stopped; final transcription is running.
     Transcribing,
 }
@@ -131,6 +158,8 @@ pub enum MeetingRequest {
     Stop,
     /// Regenerate Apple Intelligence notes for a completed meeting.
     Summarize(String),
+    /// Import a local audio file as a meeting (macOS; Labs › Import audio).
+    Import(PathBuf),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -181,7 +210,7 @@ pub struct MeetingManifest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chapters_refined: bool,
     /// Recorded since retention began: until the user chooses one, it is
-    /// kept [`MeetingRetention::DEFAULT`]. Older meetings stay until then.
+    /// kept 24 hours by default. Older meetings stay until then.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retention_applies: bool,
     /// SHA-256 of the exported Markdown as Hex last wrote it. Expiry moves
@@ -189,9 +218,40 @@ pub struct MeetingManifest {
     /// user edited stays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_sha256: Option<String>,
+    /// The notes file beside the transcript while Labs › Separate notes file
+    /// wrote one, tracked so renames, Trash, and retention follow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_export_path: Option<PathBuf>,
+    /// SHA-256 of the notes file as Hex last wrote it. A later notes
+    /// regeneration rewrites it only while it still matches, and expiry moves
+    /// it only then, so a copy the user edited stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_export_sha256: Option<String>,
+    /// The tracked notes file was deleted outside Hex. Hex forgets its path
+    /// and never writes another notes file for this meeting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notes_export_removed: bool,
+    /// When the meeting's WAV tracks moved to the Trash (Labs › Expire
+    /// meeting audio separately); the transcript, notes, and Markdown stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_removed_at_ms: Option<u64>,
+    /// Imported from an audio file rather than recorded: one speaker track,
+    /// labelled Speaker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub imported: bool,
 }
 
 impl MeetingManifest {
+    /// What a transcript line's source is called in the user's Markdown: an
+    /// imported meeting has one track, so every turn is just Speaker.
+    pub fn speaker_label(&self, source: MeetingSource) -> &'static str {
+        if self.imported {
+            "Speaker"
+        } else {
+            source.label()
+        }
+    }
+
     /// Where `title` came from, inferred for manifests that predate the field.
     pub fn title_source(&self) -> TitleSource {
         self.title_source.unwrap_or_else(|| {
@@ -242,6 +302,11 @@ pub struct TrackManifest {
     /// recording, filled with silence so the track stays on the timeline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gaps: Vec<TrackGap>,
+    /// A problem with this track that the user should know about. For the
+    /// microphone, `digital_silence` means the stream was digitally silent
+    /// at some point during the recording, even if its audio returned later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<TrackWarning>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -434,6 +499,11 @@ pub fn record(
         chapters_refined: false,
         retention_applies: true,
         export_sha256: None,
+        notes_export_path: None,
+        notes_export_sha256: None,
+        notes_export_removed: false,
+        audio_removed_at_ms: None,
+        imported: false,
     };
     set_title_source(&mut manifest, title_source);
     write_manifest(&meeting_dir, &manifest)?;
@@ -468,12 +538,16 @@ pub fn record(
         };
         // Each source recovers on its own: losing system audio (for example
         // when ScreenCaptureKit loses its display) never stops the microphone.
-        let microphone_capture = capture::SourceSupervisor::microphone(sink(
-            MeetingSource::Microphone,
-            &microphone_drops,
-        ));
-        let system_capture =
-            capture::SourceSupervisor::system(sink(MeetingSource::System, &system_drops));
+        let microphone_warnings = warning::TrackWarnings::new(updates.clone());
+        let microphone_capture = capture::SourceSupervisor::microphone(
+            sink(MeetingSource::Microphone, &microphone_drops),
+            start.application.clone(),
+            microphone_warnings.clone(),
+        );
+        let system_capture = capture::SourceSupervisor::system(
+            sink(MeetingSource::System, &system_drops),
+            start.application.clone(),
+        );
         manifest.status = MeetingStatus::Recording;
         if let Err(error) = write_manifest(&meeting_dir, &manifest) {
             drop(system_capture);
@@ -500,6 +574,9 @@ pub fn record(
             if let Some(chapters) = live_chapters.as_ref().and_then(|live| live.take()) {
                 record_chapters(&meeting_dir, manifest, chapters, updates.as_ref());
             }
+            // Written as soon as the microphone is warned about, so a crash
+            // while recording still says it was digitally silent.
+            warning::persist_warning(&meeting_dir, manifest, &microphone_warnings);
         };
         while !shutdown.load(Ordering::Relaxed) && !writer.is_finished() {
             take_updates(&mut manifest);
@@ -525,6 +602,7 @@ pub fn record(
         stats.microphone.dropped_packets = microphone_drops.load(Ordering::Relaxed);
         manifest.system = stats.system;
         manifest.microphone = stats.microphone;
+        manifest.microphone.warning = microphone_warnings.persisted();
         if crate::desktop::process_exit::quitting() && has_recorded_audio(&manifest) {
             // Final transcription would outlast quitting's drain.
             drop(rolling.finish());
@@ -555,6 +633,21 @@ pub fn record(
             rolling,
         ) {
             Ok(()) => manifest.status = MeetingStatus::Complete,
+            Err(error) if crate::desktop::process_exit::quitting() => {
+                // Quitting cut the final pass short: like quitting while
+                // recording, the transcript finishes at the next launch.
+                keep_rename(&meeting_dir, &mut manifest);
+                fs::write(meeting_dir.join(FINAL_PENDING_FILE), b"")?;
+                manifest.status = MeetingStatus::Interrupted;
+                manifest.error = None;
+                write_manifest(&meeting_dir, &manifest)?;
+                tracing::info!(
+                    meeting = manifest.id,
+                    %error,
+                    "Hex quit during final transcription; the transcript finishes at the next launch"
+                );
+                return Ok(manifest);
+            }
             Err(error) => {
                 keep_rename(&meeting_dir, &mut manifest);
                 manifest.status = MeetingStatus::Failed;
@@ -565,6 +658,7 @@ pub fn record(
         }
         keep_rename(&meeting_dir, &mut manifest);
         write_manifest(&meeting_dir, &manifest)?;
+        finished_events::publish(&manifest.id);
         println!("Saved meeting {}", meeting_dir.display());
         Ok(manifest)
     })();
@@ -861,6 +955,7 @@ fn transcribe(
         &crate::app_settings::meeting_output_folder(),
         manifest,
         &transcript,
+        crate::labs::meeting_notes_file(),
     ) {
         Ok(path) => {
             tracing::info!(path = %path.display(), "published meeting transcript");
@@ -876,7 +971,8 @@ fn transcribe(
     Ok(())
 }
 
-/// Meetings Hex quit while recording, oldest first.
+/// Meetings Hex left with `final.pending` (quit while recording or
+/// importing), oldest first.
 pub fn pending_final_transcripts() -> Vec<String> {
     let Ok(entries) = root().and_then(|root| Ok(fs::read_dir(root)?)) else {
         return Vec::new();
@@ -890,10 +986,11 @@ pub fn pending_final_transcripts() -> Vec<String> {
     ids
 }
 
-/// Transcribes and publishes a meeting Hex quit while recording, as Stop
-/// would have. `None` when it is no longer pending or another process holds
-/// it. Quitting again, or a missing model, leaves it pending for the next
-/// launch; any other failure keeps it Interrupted with its draft.
+/// Transcribes and publishes a meeting left with `final.pending` (Hex quit
+/// while recording or importing), as Stop would have. `None` when it is no
+/// longer pending or another process holds it. Quitting again, or a missing
+/// model, leaves it pending for the next launch; any other failure keeps it
+/// Interrupted with its draft.
 pub fn finish_pending(id: &str) -> Result<Option<MeetingManifest>> {
     let directory = root()?.join(id);
     let Some(_active) = ActiveMeeting::try_acquire(&directory)? else {
@@ -908,27 +1005,12 @@ pub fn finish_pending(id: &str) -> Result<Option<MeetingManifest>> {
     if !crate::transcription::models::is_installed(model, &selection.language) {
         return Err(eyre!("{} is not installed", model.name));
     }
-    let mut manifest = read_manifest(&directory)?;
+    let manifest = read_manifest(&directory)?;
     tracing::info!(
         meeting = id,
-        "finishing the transcript of a meeting Hex quit while recording"
+        "finishing a meeting transcript left pending by an earlier quit"
     );
-    match transcribe(&directory, &mut manifest, &selection, None) {
-        Ok(()) => {
-            manifest.status = MeetingStatus::Complete;
-            manifest.error = None;
-            write_manifest(&directory, &manifest)?;
-            Ok(Some(manifest))
-        }
-        Err(error) if crate::desktop::process_exit::quitting() => Err(error),
-        Err(error) => {
-            manifest.status = MeetingStatus::Interrupted;
-            manifest.error = Some(error.to_string());
-            write_manifest(&directory, &manifest)?;
-            let _ = fs::remove_file(&pending);
-            Err(error)
-        }
-    }
+    finish::finish_transcription(&directory, manifest, &selection).map(Some)
 }
 
 pub fn list() -> Result<Vec<MeetingManifest>> {
@@ -1075,6 +1157,59 @@ pub fn transcript_markdown(entries: &[TranscriptEntry]) -> String {
         .join("\n\n")
 }
 
+/// The exported Markdown while it is still on disk: the file the pane's
+/// `Reveal Markdown` selects, and the one Trash takes with the recording.
+fn exported_markdown(manifest: &MeetingManifest) -> Option<PathBuf> {
+    manifest.export_path.clone().filter(|path| path.exists())
+}
+
+/// What the Meetings pane's reveal action shows: the exported Markdown while
+/// it still exists, else the meeting's recording folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RevealTarget {
+    Markdown(PathBuf),
+    Folder(PathBuf),
+}
+
+impl RevealTarget {
+    /// The target for one meeting: [`exported_markdown`] while it finds the
+    /// file, else its `directory`. The pane labels the menu with it and the
+    /// host reveals it, so the two can't disagree.
+    pub fn for_meeting(manifest: &MeetingManifest, directory: &Path) -> Self {
+        match exported_markdown(manifest) {
+            Some(path) => Self::Markdown(path),
+            None => Self::Folder(directory.to_path_buf()),
+        }
+    }
+
+    /// The file or folder the desktop's file manager shows.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Markdown(path) | Self::Folder(path) => path,
+        }
+    }
+
+    /// Whether the pane labels this target `Reveal Markdown`.
+    pub fn is_markdown(&self) -> bool {
+        matches!(self, Self::Markdown(_))
+    }
+}
+
+/// Explorer's argument that selects `path`: `/select,"C:\…\file.md"`.
+///
+/// The path is quoted on its own because Explorer reads the switch only while
+/// the comma is outside the quotes. `Command` would quote the whole argument
+/// once a folder name has a space, which Explorer ignores. Its bytes are kept
+/// as they are: the path is already absolute by the time the Windows caller
+/// passes it, so `GetFullPathNameW` has normalized any forward slashes.
+#[cfg(any(windows, test))]
+fn explorer_select(path: &Path) -> std::ffi::OsString {
+    let mut select = std::ffi::OsString::from("/select,\"");
+    select.push(path.as_os_str());
+    select.push("\"");
+    select
+}
+
 /// Moves a finished meeting to the Trash: its exported Markdown first, then
 /// its recording folder. Refuses while it records, transcribes, or writes
 /// notes. A missing Markdown file is skipped.
@@ -1093,104 +1228,11 @@ fn trash_meeting(
     if notes_in_progress(&manifest.id) {
         return Err(eyre!("Wait for the notes to finish before deleting"));
     }
-    if let Some(path) = manifest.export_path.filter(|path| path.exists()) {
+    if let Some(path) = exported_markdown(&manifest) {
         move_to_trash(&path)?;
     }
-    move_to_trash(directory)
-}
-
-/// How long `manifest` is kept: the retention the user chose, else
-/// [`MeetingRetention::DEFAULT`] for meetings recorded since it began, and
-/// older meetings for good.
-pub fn retention_for(
-    manifest: &MeetingManifest,
-    chosen: Option<MeetingRetention>,
-) -> MeetingRetention {
-    chosen.unwrap_or(if manifest.retention_applies {
-        MeetingRetention::DEFAULT
-    } else {
-        MeetingRetention::Forever
-    })
-}
-
-/// Whether a finished meeting outlived its retention, counted from when it
-/// ended (or, with no end, started). A meeting that records or transcribes
-/// never has.
-pub fn expired(
-    manifest: &MeetingManifest,
-    status: MeetingStatus,
-    chosen: Option<MeetingRetention>,
-    now_ms: u64,
-) -> bool {
-    !status.is_active()
-        && retention_for(manifest, chosen)
-            .max_age_ms()
-            .is_some_and(|max_age_ms| {
-                let ended = manifest.ended_at_ms.unwrap_or(manifest.created_at_ms);
-                now_ms.saturating_sub(ended) > max_age_ms
-            })
-}
-
-/// Moves every expired meeting to the Trash: its folder, and its exported
-/// Markdown while that is still the copy Hex wrote. One that is recording,
-/// transcribing, writing notes, or waiting for its final transcript stays
-/// for a later pass. Returns how many moved.
-pub fn expire(chosen: Option<MeetingRetention>) -> Result<usize> {
-    let meetings = list()?;
-    let pending = pending_final_transcripts();
-    let root = root()?;
-    let mut moved = 0;
-    for id in expired_meetings(&meetings, chosen, &pending, now_ms()) {
-        match trash_expired(&root.join(id), os::move_to_trash) {
-            Ok(()) => {
-                moved += 1;
-                tracing::info!(meeting = id, "moved an expired meeting to the Trash");
-            }
-            Err(error) => {
-                tracing::info!(%error, meeting = id, "kept an expired meeting for now");
-            }
-        }
-    }
-    Ok(moved)
-}
-
-/// The expired meetings in `meetings`, leaving out `pending` ones.
-fn expired_meetings<'a>(
-    meetings: &'a [MeetingManifest],
-    chosen: Option<MeetingRetention>,
-    pending: &[String],
-    now_ms: u64,
-) -> Vec<&'a str> {
-    meetings
-        .iter()
-        .filter(|meeting| !pending.contains(&meeting.id))
-        .filter(|meeting| expired(meeting, meeting.status, chosen, now_ms))
-        .map(|meeting| meeting.id.as_str())
-        .collect()
-}
-
-/// [`trash_meeting`] for expiry: an exported Markdown the user changed is
-/// left where it is.
-fn trash_expired(
-    directory: &Path,
-    mut move_to_trash: impl FnMut(&Path) -> Result<()>,
-) -> Result<()> {
-    let manifest = read_manifest(directory)?;
-    if meeting_is_active(directory) != Some(false) {
-        return Err(eyre!("the meeting is recording"));
-    }
-    if notes_in_progress(&manifest.id) {
-        return Err(eyre!("its notes are being written"));
-    }
-    if let Some(path) = manifest.export_path.filter(|path| path.exists()) {
-        if manifest.export_sha256.is_some() && file_sha256(&path) == manifest.export_sha256 {
-            move_to_trash(&path)?;
-        } else {
-            tracing::info!(
-                meeting = manifest.id,
-                "kept the meeting's Markdown, which changed since Hex wrote it"
-            );
-        }
+    if let Some(path) = notes_file::tracked(&manifest) {
+        move_to_trash(&path)?;
     }
     move_to_trash(directory)
 }
@@ -1209,12 +1251,25 @@ fn text_sha256(bytes: &[u8]) -> String {
 }
 
 /// Renames a meeting. The Markdown heading follows only while it still reads
-/// the previous title, and the file keeps its name, as with generated titles.
+/// the previous title. The file keeps its name unless Labs › Descriptive
+/// meeting file names is on, which renames it to the new title.
 pub fn rename(id: &str, title: &str) -> Result<MeetingManifest> {
     rename_meeting(&root()?.join(id), title)
 }
 
 fn rename_meeting(directory: &Path, title: &str) -> Result<MeetingManifest> {
+    rename_meeting_with(
+        directory,
+        title,
+        crate::labs::meeting_descriptive_filenames(),
+    )
+}
+
+fn rename_meeting_with(
+    directory: &Path,
+    title: &str,
+    descriptive_filenames: bool,
+) -> Result<MeetingManifest> {
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     if title.is_empty() {
         return Err(eyre!("The title is empty"));
@@ -1229,13 +1284,26 @@ fn rename_meeting(directory: &Path, title: &str) -> Result<MeetingManifest> {
     set_title_source(&mut manifest, TitleSource::User);
     let next = display_title(&manifest);
     let mut markdown_error = None;
-    if previous != next
+    let title_changed = previous != next;
+    let mut heading_updated = title_changed;
+    if heading_updated
         && let Some(path) = manifest.export_path.clone().filter(|path| path.exists())
         && let Err(error) =
             notes::retitle_markdown_file(&path, &mut manifest.export_sha256, &previous, &next)
     {
         tracing::warn!(%error, meeting = id, "could not retitle meeting Markdown");
         markdown_error = Some(error);
+        heading_updated = false;
+    }
+    // The notes writer applies its own title and renames the file; leaving
+    // the name alone here keeps it from racing that in-place rewrite. A
+    // failed heading update keeps the old name too, as notes do. The notes
+    // file follows the title independently, since it is Hex's own copy.
+    if heading_updated && !notes_in_progress(&manifest.id) {
+        export_name::rename_to_title(&mut manifest, &next, descriptive_filenames);
+    }
+    if title_changed && !notes_in_progress(&manifest.id) {
+        notes_file::refresh(&mut manifest);
     }
     write_manifest(directory, &manifest)?;
     match markdown_error {
@@ -1258,6 +1326,9 @@ pub fn transcribe_meeting(id: &str) -> Result<MeetingManifest> {
         return Err(eyre!("Stop the recording before transcribing it"));
     }
     let mut manifest = read_manifest(&directory)?;
+    if manifest.audio_removed_at_ms.is_some() {
+        return Err(eyre!("this meeting's audio was deleted"));
+    }
     if !has_recorded_audio(&manifest) {
         return Err(eyre!("meeting has no recorded audio"));
     }

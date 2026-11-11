@@ -2,8 +2,17 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    check_windows_split();
     build_version();
     test_build_commit();
+    // `hex_dev_onboarding`: the first run's replay strip and its swearing
+    // jokes, in debug and `HEX_TEST_BUILD=1` builds only.
+    println!("cargo::rustc-check-cfg=cfg(hex_dev_onboarding)");
+    if std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some()
+        || std::env::var("HEX_TEST_BUILD").as_deref() == Ok("1")
+    {
+        println!("cargo::rustc-cfg=hex_dev_onboarding");
+    }
     // `hex_capture`: the `capture` experiment's code, in every macOS, Linux,
     // and Windows build (`scrawl-capture` is their dependency).
     println!("cargo::rustc-check-cfg=cfg(hex_capture)");
@@ -24,15 +33,19 @@ fn main() {
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
             // transcribe-cpp's Vulkan backend links the vulkan-1 import
             // library by name without its search path. The DLL itself ships
-            // with the GPU driver.
+            // with the GPU driver, so it is delay-loaded: a missing or
+            // Vulkan 1.0 loader must not stop Hex at launch (#1240;
+            // `windows::vulkan` keeps ggml off it then).
             println!("cargo:rerun-if-env-changed=VULKAN_SDK");
-            if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
-                && let Some(sdk) = std::env::var_os("VULKAN_SDK")
-            {
-                println!(
-                    "cargo:rustc-link-search=native={}",
-                    PathBuf::from(sdk).join("Lib").display()
-                );
+            if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+                if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
+                    println!(
+                        "cargo:rustc-link-search=native={}",
+                        PathBuf::from(sdk).join("Lib").display()
+                    );
+                }
+                println!("cargo:rustc-link-arg=/DELAYLOAD:vulkan-1.dll");
+                println!("cargo:rustc-link-lib=delayimp");
             }
             #[cfg(windows)]
             embed_windows_resources();
@@ -48,6 +61,9 @@ fn main() {
     compile_swift_bridge("apple_speech", "HEXAppleSpeechBridge", &[]);
     println!("cargo:rustc-link-lib=framework=AVFAudio");
     println!("cargo:rustc-link-lib=framework=Speech");
+    // AVFoundation decodes an imported meeting's audio into a 16 kHz WAV.
+    compile_swift_bridge("meeting_import", "HEXMeetingImportBridge", &[]);
+    println!("cargo:rustc-link-lib=framework=AudioToolbox");
     // FoundationModels exists only on macOS 26 and later. Weak-link it, and
     // drop the object's strong autolink entry, so Hex still launches on older
     // systems and reports Apple Intelligence as unavailable.
@@ -75,6 +91,37 @@ fn main() {
 /// other build of the unstamped `0.0.0`, `0.0.0-dev-local-<commit>` with
 /// `-dirty` for uncommitted changes (`0.0.0-dev-local` without git, as in Nix).
 /// It counts as a dev build, so it follows the dev channel's current release.
+/// Fails every OS's build when Cargo.lock puts gpu-allocator and wgpu-hal on
+/// different `windows` crates. wgpu-hal passes D3D12 types into
+/// gpu-allocator, so the split only breaks the Windows build, and
+/// `cargo update -p rune` has re-resolved gpu-allocator onto an older
+/// `windows` twice (#997, #1085). Fix it by setting gpu-allocator's `windows`
+/// (and iana-time-zone's `windows-core`) back to wgpu-hal's version.
+fn check_windows_split() {
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    let Ok(lock) = std::fs::read_to_string("Cargo.lock") else {
+        return;
+    };
+    let windows = |name: &str| {
+        lock.split("[[package]]")
+            .find(|block| block.contains(&format!("\nname = \"{name}\"\n")))
+            .and_then(|block| {
+                block
+                    .lines()
+                    .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+                    .find(|dependency| {
+                        *dependency == "windows" || dependency.starts_with("windows ")
+                    })
+                    .map(str::to_owned)
+            })
+    };
+    let (allocator, hal) = (windows("gpu-allocator"), windows("wgpu-hal"));
+    assert_eq!(
+        allocator, hal,
+        "Cargo.lock: gpu-allocator must use wgpu-hal's `windows` crate, or the Windows build breaks"
+    );
+}
+
 fn build_version() {
     println!("cargo:rerun-if-env-changed=HEX_VERSION");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();

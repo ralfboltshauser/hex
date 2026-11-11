@@ -12,9 +12,20 @@ use cpal::{
 
 use super::{CaptureInstant, StreamErrorReporter, build_stream};
 
+/// A running microphone stream; dropping it stops capture.
+pub(super) enum InputStream {
+    Cpal {
+        _stream: Stream,
+    },
+    #[cfg(target_os = "windows")]
+    Wasapi {
+        _capture: super::wasapi_capture::WasapiCapture,
+    },
+}
+
 /// A started microphone stream and the channels its callback feeds.
 pub(super) struct StartedStream {
-    pub stream: Stream,
+    pub stream: InputStream,
     pub chunks: Receiver<(Vec<f32>, CaptureInstant)>,
     pub stream_errors: Receiver<String>,
     pub hex_microphone: crate::audio::hex_microphone::CaptureFeedSwitch,
@@ -36,6 +47,23 @@ pub(super) fn start_stream_with_fallback(
     let supported = device
         .default_input_config()
         .wrap_err("could not read the input device configuration")?;
+    // ALSA's default period, PipeWire's included, can be large: about a
+    // second of audio per chunk put speech from before the press into the
+    // pre-roll (#1309). Ask for about 20 ms first.
+    #[cfg(target_os = "linux")]
+    if let Some(&period) =
+        fixed_buffer_sizes(supported.sample_rate(), supported.buffer_size()).first()
+    {
+        match start_stream(device, &supported, period, default_name.clone()) {
+            Ok(started) => return Ok(started),
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                device = %device_name,
+                buffer = ?period,
+                "the microphone refused a short period; using its default"
+            ),
+        }
+    }
     let error = match start_stream(
         device,
         &supported,
@@ -50,6 +78,18 @@ pub(super) fn start_stream_with_fallback(
         device = %device_name,
         "the microphone refused its default format; trying the others it lists"
     );
+    // Intel Smart Sound refused every stream cpal built, at any format and
+    // buffer, so Hex tries its own WASAPI paths next (#988).
+    #[cfg(target_os = "windows")]
+    match super::wasapi_capture::start(device, device_name) {
+        Ok(started) => return Ok(started),
+        Err(wasapi_error) => tracing::warn!(
+            error = format!("{wasapi_error:#}"),
+            device = %device_name,
+            cpal_thread_apartment = %super::wasapi_capture::apartment(),
+            "the microphone refused every direct wasapi path; trying the formats it lists"
+        ),
+    }
     // Some drivers refuse every format with the backend's default buffer
     // (Intel Smart Sound answered E_INVALIDARG for each, #988) yet accept
     // the same format with an explicit buffer duration, so each format is
@@ -237,7 +277,7 @@ fn start_stream(
         )
     })?;
     Ok(StartedStream {
-        stream,
+        stream: InputStream::Cpal { _stream: stream },
         chunks,
         stream_errors,
         hex_microphone,

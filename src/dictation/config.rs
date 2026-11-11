@@ -7,6 +7,7 @@ use crate::dictation::text_replacements::ReplacementSet;
 
 static DICTATION_PROFILES: OnceLock<RwLock<Profiles>> = OnceLock::new();
 static READS_BROWSER: AtomicBool = AtomicBool::new(false);
+static READS_WINDOW_TITLE: AtomicBool = AtomicBool::new(false);
 
 /// Whether anything the user set up looks at the page: a mode chosen by
 /// website, an OpenCode rewrite (its prompt names the site), or a script
@@ -16,20 +17,21 @@ pub fn reads_browser() -> bool {
     READS_BROWSER.load(Ordering::Acquire)
 }
 
+/// Whether a script transformation is set up, the only reader of the front
+/// window's title. Otherwise Hex never reads it.
+pub fn reads_window_title() -> bool {
+    READS_WINDOW_TITLE.load(Ordering::Acquire)
+}
+
+fn uses_scripts(settings: &DictationProcessingSettings) -> bool {
+    std::iter::once(&settings.default_mode)
+        .chain(&settings.modes)
+        .flat_map(|mode| &mode.transformations)
+        .any(|id| !crate::personal_commands::is_builtin_transformation(id))
+}
+
 fn uses_browser(settings: &DictationProcessingSettings) -> bool {
-    settings
-        .modes
-        .iter()
-        .any(|mode| !mode.browser_hosts.is_empty())
-        || std::iter::once(&settings.default_mode)
-            .chain(&settings.modes)
-            .any(|mode| {
-                mode.post_processing.enabled
-                    || mode
-                        .transformations
-                        .iter()
-                        .any(|id| !crate::personal_commands::is_builtin_transformation(id))
-            })
+    crate::dictation::modes::uses_page(settings)
 }
 
 pub fn dictation_profiles() -> Profiles {
@@ -39,9 +41,20 @@ pub fn dictation_profiles() -> Profiles {
         .clone()
 }
 
+/// The speech model and language the mode `settings` select for `context`,
+/// through the same selectors processing uses: a browser host first, then an
+/// exact application name, else Global. `None` means the mode never switches.
+pub fn speech_for(
+    settings: &DictationProcessingSettings,
+    context: &crate::dictation::context::ContextSnapshot,
+) -> Option<crate::app_settings::KeyboardModelChoice> {
+    build_dictation_profiles(settings).speech_for(context)
+}
+
 pub fn update_dictation_profiles(settings: &DictationProcessingSettings) {
     let profiles = build_dictation_profiles(settings);
     READS_BROWSER.store(uses_browser(settings), Ordering::Release);
+    READS_WINDOW_TITLE.store(uses_scripts(settings), Ordering::Release);
     *dictation_profiles_lock()
         .write()
         .unwrap_or_else(|error| error.into_inner()) = profiles;
@@ -64,7 +77,8 @@ fn build_dictation_profiles(settings: &DictationProcessingSettings) -> Profiles 
             global.transformations.clone(),
             &global.post_processing,
         )
-        .vocabulary(global.vocabulary.clone()),
+        .vocabulary(global.vocabulary.clone())
+        .speech(global.speech.clone()),
     )
     .global_replacements(ReplacementSet::new(&global.replacements));
     for mode in &settings.modes {
@@ -126,7 +140,13 @@ mod tests {
                 ..ContextSnapshot::default()
             };
             profiles
-                .process_cancellable("I like open code", &context, &AtomicBool::new(false))
+                .process_cancellable(
+                    "I like open code",
+                    "en",
+                    &context,
+                    &AtomicBool::new(false),
+                    crate::dictation::processor::Source::Dictation,
+                )
                 .text
         };
 
@@ -163,6 +183,56 @@ mod tests {
     }
 
     #[test]
+    fn a_modes_speech_choice_uses_the_same_selectors_as_its_processing() {
+        use crate::app_settings::{DictationMode, KeyboardModelChoice};
+        use crate::transcription::models::TranscriptionModelId;
+        let choice = |language: &str| KeyboardModelChoice {
+            model: TranscriptionModelId::ParakeetV3,
+            language: language.into(),
+        };
+        let settings = DictationProcessingSettings {
+            default_mode: DictationMode {
+                speech: Some(choice("en")),
+                ..DictationMode::default()
+            },
+            modes: vec![
+                DictationMode {
+                    applications: vec!["Slack".into()],
+                    speech: Some(choice("de")),
+                    ..DictationMode::default()
+                },
+                DictationMode {
+                    browser_hosts: vec!["x.com".into()],
+                    speech: Some(choice("es")),
+                    ..DictationMode::default()
+                },
+            ],
+        };
+        let profiles = build_dictation_profiles(&settings);
+        let speech = |application: &str, url: Option<&str>| {
+            profiles.speech_for(&ContextSnapshot {
+                application: Some(application.into()),
+                browser_url: url.map(|url| url::Url::parse(url).unwrap()),
+                ..ContextSnapshot::default()
+            })
+        };
+
+        // An exact application name (a `.app` suffix never matters here).
+        assert_eq!(speech("Slack", None).unwrap().language, "de");
+        // A website is more specific than the application.
+        assert_eq!(
+            speech("Safari", Some("https://x.com/home"))
+                .unwrap()
+                .language,
+            "es"
+        );
+        // Nothing matches, so Global's own choice applies.
+        assert_eq!(speech("Notes", None).unwrap().language, "en");
+        let bare = build_dictation_profiles(&DictationProcessingSettings::default());
+        assert!(bare.speech_for(&ContextSnapshot::default()).is_none());
+    }
+
+    #[test]
     fn browsers_are_asked_only_when_something_uses_the_page() {
         use crate::app_settings::{DictationMode, DictationPostProcessing};
         let with = |mode: DictationMode| DictationProcessingSettings {
@@ -180,18 +250,32 @@ mod tests {
             browser_hosts: vec!["x.com".into()],
             ..DictationMode::default()
         })));
-        assert!(uses_browser(&with(DictationMode {
+        let script = with(DictationMode {
             applications: vec!["Slack".into()],
             transformations: vec!["my-script".into()],
             ..DictationMode::default()
-        })));
-        assert!(uses_browser(&with(DictationMode {
+        });
+        assert!(uses_browser(&script));
+        assert!(uses_scripts(&script));
+        let rewrite = with(DictationMode {
             applications: vec!["Slack".into()],
             post_processing: DictationPostProcessing {
                 enabled: true,
                 ..DictationPostProcessing::default()
             },
             ..DictationMode::default()
-        })));
+        });
+        assert!(uses_browser(&rewrite));
+        assert!(!uses_scripts(&rewrite));
+
+        let global = |transformation: &str| DictationProcessingSettings {
+            default_mode: DictationMode {
+                transformations: vec![transformation.into()],
+                ..DictationMode::default()
+            },
+            ..DictationProcessingSettings::default()
+        };
+        assert!(uses_scripts(&global("my-script")));
+        assert!(!uses_scripts(&global("lowercase")));
     }
 }

@@ -6,11 +6,12 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use transcribe_cpp::{Backend, Model, ModelOptions, RunOptions, TimestampKind};
 
 use crate::app_settings::TranscriptionDevice;
-use crate::transcription::gguf_session::OfflineGgufSession;
+use crate::transcription::gguf_session::{OfflineGgufSession, output_truncated};
 use crate::transcription::gpu_health;
 use crate::transcription::models::{
-    TranscriptionSelection, download_with_progress, model_path, validate,
+    TranscriptionModelId, TranscriptionSelection, download_with_progress, model_path, validate,
 };
+use crate::transcription::{pad_gguf_samples, trailing_silence_samples};
 
 /// A word or segment's start and end (ms from the clip's start) and text.
 pub type TimedSpan = (i64, i64, String);
@@ -31,6 +32,9 @@ pub struct LocalTranscriber {
     preference: TranscriptionDevice,
     /// A warm run of [`PREWARM_SAMPLES`] once loaded, in milliseconds.
     warm_ms: u128,
+    /// It loaded on the CPU because the GPU ran out of memory, as it does
+    /// when another copy of a model already fills it (#1170).
+    gpu_full: bool,
 }
 
 /// 1.5 s of silence: what loading runs to warm a model and time it.
@@ -70,27 +74,40 @@ pub fn install(selection: &TranscriptionSelection, canceled: &AtomicBool) -> Res
     Ok(())
 }
 
+/// Speech engine was CPU when [`init_backends`] ran, so only the CPU
+/// backend registered.
+static CPU_CHOSEN: AtomicBool = AtomicBool::new(false);
+
 /// Registers transcribe.cpp's backends once per process and returns the
-/// backend models load on: every GPU (`Auto`), or on Windows only the CPU
-/// after a launch of this build crashed while ggml started a GPU (#662). A
-/// GPU driver crash can't be caught, so a marker file spans that work.
+/// backend models load on: every GPU (`Auto`), or only the CPU when Speech
+/// engine is CPU, so no GPU driver loads (#1253), or on Windows after a
+/// launch of this build crashed while ggml started a GPU (#662). A GPU
+/// driver crash can't be caught, so a marker file spans that work.
 pub fn init_backends() -> Result<Backend> {
     static BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
     if let Some(backend) = BACKEND.get() {
         return Ok(*backend);
     }
     transcribe_cpp::init_logging();
+    let cpu_only = || {
+        transcribe_cpp::init_backends_with(
+            None::<&Path>,
+            transcribe_cpp::BackendMask::for_backend(Backend::Cpu),
+        )
+        .wrap_err("could not initialize the CPU transcription backend")
+    };
     #[cfg(target_os = "windows")]
     if gpu_guard::crashed_before() {
         tracing::warn!(
             marker = %gpu_guard::marker().map(|path| path.display().to_string()).unwrap_or_default(),
             "a previous launch of this Hex crashed while starting the GPU for transcription; transcribing on the CPU until Hex updates or the marker is deleted"
         );
-        transcribe_cpp::init_backends_with(
-            None::<&Path>,
-            transcribe_cpp::BackendMask::for_backend(Backend::Cpu),
-        )
-        .wrap_err("could not initialize the CPU transcription backend")?;
+        cpu_only()?;
+        return Ok(*BACKEND.get_or_init(|| Backend::Cpu));
+    }
+    if device() == TranscriptionDevice::Cpu {
+        cpu_only()?;
+        CPU_CHOSEN.store(true, Ordering::Relaxed);
         return Ok(*BACKEND.get_or_init(|| Backend::Cpu));
     }
     let init = || {
@@ -103,6 +120,12 @@ pub fn init_backends() -> Result<Backend> {
     let init = || gpu_guard::guarded(init);
     init().wrap_err("could not initialize transcription backends")?;
     Ok(*BACKEND.get_or_init(|| Backend::Auto))
+}
+
+/// Speech engine left CPU after this launch registered the CPU alone: the
+/// GPU needs a restart.
+pub(crate) fn gpu_after_restart() -> bool {
+    CPU_CHOSEN.load(Ordering::Relaxed) && device() != TranscriptionDevice::Cpu
 }
 
 /// The marker a Windows launch keeps while ggml starts a GPU (`init_backends`,
@@ -192,9 +215,20 @@ pub fn transcribe_wav_with_selection(
     LocalTranscriber::load(selection)?.transcribe(&samples)
 }
 
+/// A WAV already in memory, as `hex transcribe` read it.
+pub fn transcribe_wav_bytes(wav: &[u8], selection: &TranscriptionSelection) -> Result<String> {
+    let samples = read_wav(std::io::Cursor::new(wav))?;
+    LocalTranscriber::load(selection)?.transcribe(&samples)
+}
+
 pub fn read_wav_for_parakeet(path: &Path) -> Result<Vec<f32>> {
-    let mut reader = hound::WavReader::open(path)
-        .wrap_err_with(|| format!("could not open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).wrap_err_with(|| format!("could not open {}", path.display()))?;
+    read_wav(std::io::BufReader::new(file))
+}
+
+fn read_wav(reader: impl std::io::Read + std::io::Seek) -> Result<Vec<f32>> {
+    let mut reader = hound::WavReader::new(reader)?;
     let spec = reader.spec();
     let samples = match spec.sample_format {
         hound::SampleFormat::Float => reader
@@ -280,10 +314,18 @@ impl LocalTranscriber {
                     error = format!("{error:#}"),
                     "could not load the transcription model on the GPU; loading it on the CPU"
                 );
-                let loaded = Self::load_on(selection, Backend::Cpu, None, preference)?;
-                // The CPU loads the same model, so the GPU failed.
+                let mut loaded = Self::load_on(selection, Backend::Cpu, None, preference)?;
+                // The CPU loads the same model, so the GPU failed, unless it
+                // only ran out of memory (another copy can fill it, #1165).
                 if let Some(gpu) = &expected {
-                    gpu_health::record(gpu, &format!("{error:#}"));
+                    if gpu_health::out_of_memory(&error) {
+                        tracing::info!(
+                            "the GPU ran out of memory; not remembering it as failed, Auto tries it again next load"
+                        );
+                        loaded.gpu_full = true;
+                    } else {
+                        gpu_health::record(gpu, &format!("{error:#}"));
+                    }
                 }
                 Ok(loaded)
             }
@@ -365,6 +407,7 @@ impl LocalTranscriber {
             .then(|| device.clone()),
             preference,
             warm_ms: 0,
+            gpu_full: false,
         };
         let started = Instant::now();
         transcriber.warm_on_silence()?;
@@ -383,12 +426,25 @@ impl LocalTranscriber {
         Ok(transcriber)
     }
 
-    /// Runs [`PREWARM_SAMPLES`] of silence through the model. A decoder
-    /// that runs to its generation cap on silence (Qwen3-ASR 1.7B, #968)
-    /// still ran the whole graph on the device, so that is a warm model,
-    /// not a failed device.
+    /// Runs [`PREWARM_SAMPLES`] of silence through the model, without the
+    /// vocabulary prompt: with it, a decoder such as Qwen3-ASR reads a long
+    /// term list back to its output cap on every warm-up (#1568). A decode
+    /// that still runs to that cap ran the whole graph on the device, so
+    /// that is a warm model, not a failed device.
     fn warm_on_silence(&mut self) -> Result<()> {
-        match self.transcribe(&vec![0.0; PREWARM_SAMPLES]) {
+        let run = |this: &mut Self| {
+            this.session
+                .warm(&vec![0.0; PREWARM_SAMPLES], &this.options)
+                .map(drop)
+                .wrap_err("transcription failed")
+        };
+        let result = match run(self) {
+            // A GPU that fails mid-run reloads on the CPU, as a transcript
+            // does; the CPU model is warmed by its own load.
+            Err(error) if self.gpu_failed(&error) => self.recover_on_cpu(&error),
+            result => result,
+        };
+        match result {
             Err(error) if output_truncated(&error) => {
                 tracing::info!(
                     error = format!("{error:#}"),
@@ -396,12 +452,23 @@ impl LocalTranscriber {
                 );
                 Ok(())
             }
-            result => result.map(drop),
+            result => result,
         }
     }
 
     pub(crate) fn stream_options(&self) -> Option<&transcribe_cpp::StreamOptions> {
         self.stream.as_ref()
+    }
+
+    /// Silence a live stream of this model hears before it finalizes, the
+    /// same trailing silence its whole-clip runs get.
+    pub(crate) fn stream_trailing_silence(&self) -> usize {
+        trailing_silence_samples(Some(self.model_id()))
+    }
+
+    /// The model this transcriber was loaded for.
+    pub(crate) fn model_id(&self) -> TranscriptionModelId {
+        self.selection.model
     }
 
     pub(crate) fn with_stream<R>(
@@ -434,10 +501,42 @@ impl LocalTranscriber {
             .wrap_err("could not prewarm transcription model")
     }
 
-    /// Transcribes a complete 16 kHz clip, padded as a dictation's clip is.
+    /// Transcribes a complete 16 kHz clip, padded as a dictation's clip is:
+    /// the minimum duration, then Unified English's trailing silence.
     pub(crate) fn transcribe_clip(&mut self, mut samples: Vec<f32>) -> Result<String> {
-        crate::dictation::pad_for_parakeet(&mut samples);
+        pad_gguf_samples(&mut samples, Some(self.model_id()));
         self.transcribe(&samples)
+    }
+
+    /// [`Self::transcribe_clip`] with the model's own segment and word times,
+    /// chunked and padded exactly as the untimed run chunks and pads it, so
+    /// the text matches and each chunk's times sit on the clip's timeline.
+    pub(crate) fn transcribe_timed(
+        &mut self,
+        mut samples: Vec<f32>,
+    ) -> Result<crate::transcription::transcript::Transcript> {
+        pad_gguf_samples(&mut samples, Some(self.model_id()));
+        let options = RunOptions {
+            timestamps: self.finest_timestamps,
+            ..self.options.clone()
+        };
+        match self
+            .session
+            .transcribe_chunked_timed(&samples, &options, self.max_audio_samples)
+        {
+            Err(error) if self.gpu_failed(&error) => {
+                self.recover_on_cpu(&error)?;
+                self.session
+                    .transcribe_chunked_timed(&samples, &options, self.max_audio_samples)
+            }
+            result => result,
+        }
+    }
+
+    /// The finest native timings this model gives, as a timed request needs
+    /// them. Never the level a caller asked for.
+    pub(crate) fn timestamps(&self) -> crate::transcription::transcript::TimestampLevel {
+        crate::transcription::gguf_session::timestamp_level(self.finest_timestamps)
     }
 
     pub fn device_label(&self) -> &str {
@@ -541,7 +640,9 @@ impl LocalTranscriber {
         );
         let gpu = self.gpu.take();
         let cpu = Self::load_on(&self.selection, Backend::Cpu, None, self.preference)?;
-        if let Some(gpu) = &gpu {
+        if let Some(gpu) = &gpu
+            && !gpu_health::out_of_memory(error)
+        {
             gpu_health::record(gpu, &format!("{error:#}"));
         }
         gpu_health::set_auto_on_cpu(self.preference == TranscriptionDevice::Auto);
@@ -612,16 +713,6 @@ impl LocalTranscriber {
     }
 }
 
-/// Whether `error` is a decode stopped at its output limit.
-fn output_truncated(error: &color_eyre::eyre::Report) -> bool {
-    error.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<transcribe_cpp::Error>(),
-            Some(transcribe_cpp::Error::OutputTruncated { .. })
-        )
-    })
-}
-
 /// The local API's own model, loaded for the selection a host asks for
 /// when the dictation engine holds another one.
 #[derive(Default)]
@@ -667,6 +758,9 @@ pub(crate) struct ModelSwap {
     device: TranscriptionDevice,
     loading: Option<(TranscriptionSelection, TranscriptionDevice, Loading)>,
     ready: Option<(TranscriptionSelection, LocalTranscriber)>,
+    /// A selection whose load beside the running model found the GPU full:
+    /// the engine drops its model and loads this one in its place (#1170).
+    reload: Option<(TranscriptionSelection, TranscriptionDevice)>,
 }
 
 impl ModelSwap {
@@ -676,6 +770,7 @@ impl ModelSwap {
             device: device(),
             loading: None,
             ready: None,
+            reload: None,
         }
     }
 
@@ -685,6 +780,10 @@ impl ModelSwap {
         self.ready
             .as_ref()
             .map(|(selection, model)| (selection, model.preference))
+            .or(self
+                .reload
+                .as_ref()
+                .map(|(selection, device)| (selection, *device)))
             .or(self
                 .loading
                 .as_ref()
@@ -701,7 +800,25 @@ impl ModelSwap {
         transcriber: LocalTranscriber,
     ) {
         self.loading = None;
-        self.ready = Some((selection.clone(), transcriber));
+        self.place(selection.clone(), transcriber);
+    }
+
+    /// Keeps a loaded model to swap in, unless it fell back to the CPU only
+    /// because the running model fills the GPU: then it is dropped, and the
+    /// engine reloads the selection once its own model is gone.
+    fn place(&mut self, selection: TranscriptionSelection, transcriber: LocalTranscriber) {
+        if transcriber.gpu_full {
+            tracing::info!(
+                "the GPU has no room for the new model beside the running one; loading it in its place"
+            );
+            let device = transcriber.preference;
+            drop(transcriber);
+            self.ready = None;
+            self.reload = Some((selection, device));
+        } else {
+            self.reload = None;
+            self.ready = Some((selection, transcriber));
+        }
     }
 
     /// Settings now select `selection`; loads it unless it is already the
@@ -715,6 +832,7 @@ impl ModelSwap {
             return;
         }
         self.ready = None;
+        self.reload = None;
         if selection == self.loaded && device == self.device {
             self.loading = None;
             return;
@@ -746,7 +864,7 @@ impl ModelSwap {
         let (selection, _, _) = self.loading.take()?;
         match result {
             Ok(transcriber) => {
-                self.ready = Some((selection, transcriber));
+                self.place(selection, transcriber);
                 None
             }
             Err(error) => Some(SwapFailed {
@@ -763,6 +881,17 @@ impl ModelSwap {
         self.loaded = selection;
         self.device = transcriber.preference;
         Some(transcriber)
+    }
+
+    /// The selection the engine should load in place of its model, if the
+    /// GPU had no room for both ([`TranscriptionEngine::reload`]).
+    ///
+    /// [`TranscriptionEngine::reload`]: crate::transcription::engine::TranscriptionEngine::reload
+    pub(crate) fn take_reload(&mut self) -> Option<TranscriptionSelection> {
+        let (selection, device) = self.reload.take()?;
+        self.loaded = selection.clone();
+        self.device = device;
+        Some(selection)
     }
 }
 
@@ -783,22 +912,6 @@ mod model_swap_tests {
     use crate::transcription::models::TranscriptionModelId;
 
     #[test]
-    fn a_truncated_decode_is_recognised_through_its_context() {
-        let truncated: Result<()> = Err(transcribe_cpp::Error::OutputTruncated {
-            message: "budget".into(),
-            partial: None,
-        })
-        .wrap_err("transcription failed");
-        assert!(output_truncated(&truncated.unwrap_err()));
-        let other: Result<()> = Err(transcribe_cpp::Error::OutputRepetition {
-            message: "loop".into(),
-            partial: None,
-        })
-        .wrap_err("transcription failed");
-        assert!(!output_truncated(&other.unwrap_err()));
-    }
-
-    #[test]
     fn an_unchanged_selection_loads_nothing() {
         let selection = TranscriptionSelection {
             model: TranscriptionModelId::default(),
@@ -809,5 +922,24 @@ mod model_swap_tests {
         assert!(swap.loading.is_none());
         assert!(swap.take_ready().is_none());
         assert!(swap.poll().is_none());
+    }
+
+    #[test]
+    fn a_model_without_room_on_the_gpu_reloads_in_place_once() {
+        let old = TranscriptionSelection::default();
+        let new = TranscriptionSelection {
+            language: "de".into(),
+            ..Default::default()
+        };
+        let mut swap = ModelSwap::new(&old);
+        swap.reload = Some((new.clone(), device()));
+        // Already the target: nothing loads beside the running model.
+        swap.want(&new);
+        assert!(swap.loading.is_none());
+        assert!(swap.take_reload() == Some(new.clone()));
+        assert!(swap.take_reload().is_none());
+        swap.want(&new);
+        assert!(swap.loading.is_none());
+        assert!(swap.take_ready().is_none());
     }
 }

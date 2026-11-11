@@ -20,11 +20,12 @@ use objc2_app_kit::NSRunningApplication;
 #[cfg(target_os = "macos")]
 use objc2_core_audio::{
     AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
-    AudioObjectPropertyAddress, AudioObjectPropertySelector,
-    kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
-    kAudioProcessPropertyIsRunningInput, kAudioProcessPropertyIsRunningOutput,
-    kAudioProcessPropertyPID,
+    AudioObjectPropertyAddress, AudioObjectPropertyScope, AudioObjectPropertySelector,
+    kAudioDevicePropertyDeviceUID, kAudioHardwarePropertyProcessObjectList,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyScopeInput, kAudioObjectSystemObject, kAudioProcessPropertyBundleID,
+    kAudioProcessPropertyDevices, kAudioProcessPropertyIsRunningInput,
+    kAudioProcessPropertyIsRunningOutput, kAudioProcessPropertyPID,
 };
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CFRetained, CFString};
@@ -39,6 +40,8 @@ mod os;
 mod os;
 #[cfg(not(target_os = "macos"))]
 pub use os::active_microphone_applications;
+#[cfg(target_os = "windows")]
+pub(crate) use os::{EndpointSessions, active_endpoint_sessions, process_canonical_bundle_id};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveMicrophoneApplication {
@@ -48,8 +51,11 @@ pub struct ActiveMicrophoneApplication {
 }
 
 impl ActiveMicrophoneApplication {
-    pub fn is_supported_meeting_app(&self) -> bool {
-        self.canonical_bundle_id().is_some()
+    /// Whether this is a call app detection may offer. `more_call_apps` is
+    /// Labs › More call apps; off, the apps it adds are not meeting apps.
+    pub fn is_supported_meeting_app(&self, more_call_apps: bool) -> bool {
+        self.canonical_bundle_id()
+            .is_some_and(|canonical| more_call_apps || !is_more_call_app(canonical))
     }
 
     pub fn is_browser(&self) -> bool {
@@ -89,7 +95,23 @@ fn is_browser_id(canonical_bundle_id: Option<&str>) -> bool {
                 | "org.mozilla.firefox"
                 | "com.microsoft.edgemac"
                 | "company.thebrowser.Browser"
+                | "com.vivaldi.Vivaldi"
         )
+    )
+}
+
+/// The call apps Labs › More call apps adds. With that off they are not
+/// meeting apps, so detection behaves exactly as before.
+fn is_more_call_app(canonical_bundle_id: &str) -> bool {
+    matches!(
+        canonical_bundle_id,
+        "org.whispersystems.signal-desktop"
+            | "ru.keepcoder.Telegram"
+            | "com.tencent.xinWeChat"
+            | "jp.naver.line.mac"
+            | "com.webex.meetingmanager"
+            | "im.riot.app"
+            | "com.apple.mobilephone"
     )
 }
 
@@ -170,24 +192,89 @@ pub(crate) fn application_running_output(canonical_bundle_id: &str) -> Result<bo
         Ok(process_objects.into_iter().any(|process_object| {
             property_value::<u32>(process_object, kAudioProcessPropertyIsRunningOutput)
                 .is_ok_and(|running| running != 0)
-                && property_cf_string(process_object, kAudioProcessPropertyBundleID).is_some_and(
-                    |bundle_id| {
-                        canonical_bundle_id_for(&bundle_id, None) == Some(canonical_bundle_id)
-                    },
-                )
+                && property_cf_string(process_object, kAudioProcessPropertyBundleID)
+                    .is_some_and(|bundle_id| is_process_of(&bundle_id, canonical_bundle_id))
         }))
     })
 }
 
+#[cfg(target_os = "macos")]
+/// The UIDs of the input devices the app `canonical_bundle_id` (its helpers
+/// included) records from, read from each of its processes running input.
+/// macOS 14 and later report them; earlier systems report none.
+pub(crate) fn application_input_devices(canonical_bundle_id: &str) -> Result<Vec<String>> {
+    objc2::rc::autoreleasepool(|_| {
+        let process_objects = property_vec::<AudioObjectID>(
+            kAudioObjectSystemObject as AudioObjectID,
+            kAudioHardwarePropertyProcessObjectList,
+        )?;
+        let mut uids = Vec::new();
+        for process_object in process_objects {
+            let recording =
+                property_value::<u32>(process_object, kAudioProcessPropertyIsRunningInput)
+                    .is_ok_and(|running| running != 0)
+                    && property_cf_string(process_object, kAudioProcessPropertyBundleID)
+                        .is_some_and(|bundle_id| is_process_of(&bundle_id, canonical_bundle_id));
+            if !recording {
+                continue;
+            }
+            let Ok(devices) = property_vec_in::<AudioObjectID>(
+                process_object,
+                kAudioProcessPropertyDevices,
+                kAudioObjectPropertyScopeInput,
+            ) else {
+                continue;
+            };
+            for device in devices {
+                if let Some(uid) = property_cf_string(device, kAudioDevicePropertyDeviceUID)
+                    && !uids.contains(&uid)
+                {
+                    uids.push(uid);
+                }
+            }
+        }
+        Ok(uids)
+    })
+}
+
+/// Whether the Core Audio process `bundle_id` belongs to the app
+/// `canonical_bundle_id`: the app itself or one of its helpers, such as the
+/// browser helper that holds the microphone for a Meet tab.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn is_process_of(bundle_id: &str, canonical_bundle_id: &str) -> bool {
+    canonical_bundle_id_for(bundle_id, None) == Some(canonical_bundle_id)
+}
+
 /// Linux and Windows executables (lowercase, without `.exe`) by the bundle
 /// identifier of the same app on macOS.
-const EXECUTABLES: [(&str, &str); 22] = [
+const EXECUTABLES: [(&str, &str); 43] = [
+    // Discord and its Canary and PTB builds, on Windows and Linux (the
+    // Flatpak runs the same binary).
+    ("discord", "com.hnc.Discord"),
+    ("discordcanary", "com.hnc.Discord"),
+    ("discordptb", "com.hnc.Discord"),
+    ("discord-canary", "com.hnc.Discord"),
+    ("discord-ptb", "com.hnc.Discord"),
+    ("com.discordapp.discord", "com.hnc.Discord"),
     // Gather for Windows.
     ("gather", "com.gather.GatherV2"),
     ("gatherv2", "com.gather.GatherV2"),
     // WhatsApp for Windows, before and after its WinUI rewrite.
     ("whatsapp", "net.whatsapp.WhatsApp"),
     ("whatsapp.root", "net.whatsapp.WhatsApp"),
+    // The apps Labs › More call apps adds.
+    ("signal", "org.whispersystems.signal-desktop"),
+    ("signal-desktop", "org.whispersystems.signal-desktop"),
+    ("telegram", "ru.keepcoder.Telegram"),
+    ("telegram-desktop", "ru.keepcoder.Telegram"),
+    ("element", "im.riot.app"),
+    ("element-desktop", "im.riot.app"),
+    ("webex", "com.webex.meetingmanager"),
+    // The Webex app's multiprocess host on Windows (Cisco's executable list).
+    ("ciscocollabhost", "com.webex.meetingmanager"),
+    ("wechat", "com.tencent.xinWeChat"),
+    ("weixin", "com.tencent.xinWeChat"),
+    ("line", "jp.naver.line.mac"),
     ("zoom", "us.zoom.xos"),
     ("ms-teams", "com.microsoft.teams2"),
     ("teams", "com.microsoft.teams2"),
@@ -206,6 +293,11 @@ const EXECUTABLES: [(&str, &str); 22] = [
     ("msedge", "com.microsoft.edgemac"),
     ("microsoft-edge", "com.microsoft.edgemac"),
     ("microsoft-edge-stable", "com.microsoft.edgemac"),
+    // Vivaldi, its web apps (PWAs) included: they run in the same process.
+    ("vivaldi", "com.vivaldi.Vivaldi"),
+    ("vivaldi-bin", "com.vivaldi.Vivaldi"),
+    ("vivaldi-stable", "com.vivaldi.Vivaldi"),
+    ("vivaldi-snapshot", "com.vivaldi.Vivaldi"),
 ];
 
 fn canonical_bundle_id_for(bundle_id: &str, name: Option<&str>) -> Option<&'static str> {
@@ -238,6 +330,27 @@ fn canonical_bundle_id_for(bundle_id: &str, name: Option<&str>) -> Option<&'stat
         // Gather V2 and its Electron helpers, and Gather V1.
         ("com.gather.gatherv2", "com.gather.GatherV2"),
         ("com.gather.gather", "com.gather.GatherV2"),
+        // Discord and its helpers, and its Canary and PTB builds.
+        ("com.hnc.discord", "com.hnc.Discord"),
+        ("com.hnc.discordcanary", "com.hnc.Discord"),
+        ("com.hnc.discordptb", "com.hnc.Discord"),
+        // The apps Labs › More call apps adds, their Electron helpers and
+        // alternative bundle IDs included.
+        (
+            "org.whispersystems.signal-desktop",
+            "org.whispersystems.signal-desktop",
+        ),
+        ("ru.keepcoder.telegram", "ru.keepcoder.Telegram"),
+        ("com.tdesktop.telegram", "ru.keepcoder.Telegram"),
+        ("org.telegram.desktop", "ru.keepcoder.Telegram"),
+        ("com.tencent.xinwechat", "com.tencent.xinWeChat"),
+        ("jp.naver.line.mac", "jp.naver.line.mac"),
+        ("com.webex.meetingmanager", "com.webex.meetingmanager"),
+        ("com.cisco.webexmeetingsapp", "com.webex.meetingmanager"),
+        // The current Webex app uses Spark's bundle id, helpers included.
+        ("cisco-systems.spark", "com.webex.meetingmanager"),
+        ("im.riot.app", "im.riot.app"),
+        ("com.apple.mobilephone", "com.apple.mobilephone"),
         ("com.google.chrome", "com.google.Chrome"),
         ("com.brave.browser", "com.brave.Browser"),
         ("com.apple.safari", "com.apple.Safari"),
@@ -245,6 +358,7 @@ fn canonical_bundle_id_for(bundle_id: &str, name: Option<&str>) -> Option<&'stat
         ("org.mozilla.plugincontainer", "org.mozilla.firefox"),
         ("com.microsoft.edgemac", "com.microsoft.edgemac"),
         ("company.thebrowser.browser", "company.thebrowser.Browser"),
+        ("com.vivaldi.vivaldi", "com.vivaldi.Vivaldi"),
     ]
     .iter()
     .find_map(|(prefix, canonical)| {
@@ -263,12 +377,21 @@ pub(crate) fn canonical_application_name(canonical_bundle_id: &str) -> Option<&'
         "com.apple.FaceTime" => Some("FaceTime"),
         "net.whatsapp.WhatsApp" => Some("WhatsApp"),
         "com.gather.GatherV2" => Some("Gather"),
+        "com.hnc.Discord" => Some("Discord"),
+        "org.whispersystems.signal-desktop" => Some("Signal"),
+        "ru.keepcoder.Telegram" => Some("Telegram"),
+        "com.tencent.xinWeChat" => Some("WeChat"),
+        "jp.naver.line.mac" => Some("LINE"),
+        "com.webex.meetingmanager" => Some("Webex"),
+        "im.riot.app" => Some("Element"),
+        "com.apple.mobilephone" => Some("Phone"),
         "com.google.Chrome" => Some("Google Chrome"),
         "com.brave.Browser" => Some("Brave Browser"),
         "com.apple.Safari" => Some("Safari"),
         "org.mozilla.firefox" => Some("Firefox"),
         "com.microsoft.edgemac" => Some("Microsoft Edge"),
         "company.thebrowser.Browser" => Some("Arc"),
+        "com.vivaldi.Vivaldi" => Some("Vivaldi"),
         _ => None,
     }
 }
@@ -481,9 +604,17 @@ fn inspect_microphone_applications() -> Result<Vec<ActiveMicrophoneApplication>>
 
 #[cfg(target_os = "macos")]
 fn property_address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+    property_address_in(selector, kAudioObjectPropertyScopeGlobal)
+}
+
+#[cfg(target_os = "macos")]
+fn property_address_in(
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
-        mScope: kAudioObjectPropertyScopeGlobal,
+        mScope: scope,
         mElement: kAudioObjectPropertyElementMain,
     }
 }
@@ -520,7 +651,16 @@ fn property_vec<T: Copy + Default>(
     object: AudioObjectID,
     selector: AudioObjectPropertySelector,
 ) -> Result<Vec<T>> {
-    let mut address = property_address(selector);
+    property_vec_in(object, selector, kAudioObjectPropertyScopeGlobal)
+}
+
+#[cfg(target_os = "macos")]
+fn property_vec_in<T: Copy + Default>(
+    object: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+) -> Result<Vec<T>> {
+    let mut address = property_address_in(selector, scope);
     let mut size = 0;
     let status = unsafe {
         AudioObjectGetPropertyDataSize(
@@ -659,7 +799,7 @@ mod tests {
                 name: "Brave Browser".into(),
             }
         );
-        assert!(brave.is_supported_meeting_app());
+        assert!(brave.is_supported_meeting_app(false));
         assert!(brave.is_browser());
         assert_eq!(brave.canonical_bundle_id(), Some("com.brave.Browser"));
 
@@ -683,7 +823,7 @@ mod tests {
                 name: "Slack".into(),
             }
         );
-        assert!(slack.is_supported_meeting_app());
+        assert!(slack.is_supported_meeting_app(false));
         assert!(!slack.is_browser());
         assert_eq!(
             slack.canonical_bundle_id(),
@@ -763,7 +903,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(non_safari_webkit.canonical_bundle_id(), None);
-        assert!(!non_safari_webkit.is_supported_meeting_app());
+        assert!(!non_safari_webkit.is_supported_meeting_app(false));
 
         let facetime = resolve_application_with(
             8100,
@@ -795,6 +935,33 @@ mod tests {
         assert!(!BrowserProcesses::Playing.includes(Some(false)));
         assert!(BrowserProcesses::Playing.includes(None));
         assert!(BrowserProcesses::All.includes(Some(false)));
+    }
+
+    #[test]
+    fn a_call_apps_helper_processes_belong_to_it() {
+        // The processes that held the microphone in Google Meet calls (#1086).
+        assert!(is_process_of(
+            "company.thebrowser.browser.helper",
+            "company.thebrowser.Browser"
+        ));
+        assert!(is_process_of(
+            "com.google.Chrome.helper",
+            "com.google.Chrome"
+        ));
+        assert!(is_process_of(
+            "com.google.Chrome.helper.Renderer",
+            "com.google.Chrome"
+        ));
+        assert!(is_process_of("com.google.Chrome", "com.google.Chrome"));
+        assert!(!is_process_of(
+            "com.google.Chrome.helper",
+            "company.thebrowser.Browser"
+        ));
+        assert!(!is_process_of(
+            "company.thebrowser.dia",
+            "company.thebrowser.Browser"
+        ));
+        assert!(!is_process_of("com.google.Chromecast", "com.google.Chrome"));
     }
 
     #[test]
@@ -895,6 +1062,14 @@ mod tests {
                 Some("com.microsoft.edgemac"),
                 true,
             ),
+            ("vivaldi-bin", "Vivaldi", Some("com.vivaldi.Vivaldi"), true),
+            ("vivaldi.exe", "Vivaldi", Some("com.vivaldi.Vivaldi"), true),
+            (
+                "com.vivaldi.Vivaldi.helper",
+                "Vivaldi Helper",
+                Some("com.vivaldi.Vivaldi"),
+                true,
+            ),
             ("spotify", "Spotify", None, false),
         ] {
             let app = ActiveMicrophoneApplication {
@@ -905,5 +1080,73 @@ mod tests {
             assert_eq!(app.canonical_bundle_id(), expected, "bundle {bundle_id}");
             assert_eq!(app.is_browser(), browser, "browser {bundle_id}");
         }
+    }
+
+    #[test]
+    fn more_call_app_bundle_variants_and_executables_canonicalize() {
+        for (bundle_id, expected) in [
+            (
+                "org.whispersystems.signal-desktop",
+                "org.whispersystems.signal-desktop",
+            ),
+            (
+                "org.whispersystems.signal-desktop.helper.Renderer",
+                "org.whispersystems.signal-desktop",
+            ),
+            ("ru.keepcoder.Telegram", "ru.keepcoder.Telegram"),
+            ("com.tdesktop.Telegram", "ru.keepcoder.Telegram"),
+            ("com.tdesktop.Telegram.helper", "ru.keepcoder.Telegram"),
+            ("org.telegram.desktop", "ru.keepcoder.Telegram"),
+            ("com.tencent.xinWeChat", "com.tencent.xinWeChat"),
+            ("jp.naver.line.mac", "jp.naver.line.mac"),
+            ("com.webex.meetingmanager", "com.webex.meetingmanager"),
+            ("com.cisco.webexmeetingsapp", "com.webex.meetingmanager"),
+            ("Cisco-Systems.Spark", "com.webex.meetingmanager"),
+            ("Cisco-Systems.Spark.helper", "com.webex.meetingmanager"),
+            ("im.riot.app", "im.riot.app"),
+            ("com.apple.mobilephone", "com.apple.mobilephone"),
+            ("Signal.exe", "org.whispersystems.signal-desktop"),
+            ("signal-desktop", "org.whispersystems.signal-desktop"),
+            ("Telegram.exe", "ru.keepcoder.Telegram"),
+            ("telegram-desktop", "ru.keepcoder.Telegram"),
+            ("Element.exe", "im.riot.app"),
+            ("element-desktop", "im.riot.app"),
+            ("webex", "com.webex.meetingmanager"),
+            ("CiscoCollabHost.exe", "com.webex.meetingmanager"),
+            ("ciscocollabhost", "com.webex.meetingmanager"),
+            ("WeChat.exe", "com.tencent.xinWeChat"),
+            ("Weixin.exe", "com.tencent.xinWeChat"),
+            ("LINE.exe", "jp.naver.line.mac"),
+        ] {
+            assert_eq!(
+                canonical_bundle_id_for(bundle_id, None),
+                Some(expected),
+                "{bundle_id}"
+            );
+            assert!(is_more_call_app(expected), "{expected}");
+        }
+        assert!(!is_more_call_app("us.zoom.xos"));
+        assert_eq!(
+            canonical_application_name("ru.keepcoder.Telegram"),
+            Some("Telegram")
+        );
+        assert_eq!(
+            canonical_application_name("jp.naver.line.mac"),
+            Some("LINE")
+        );
+        // Off, the lab's apps are not meeting apps at all; on, they are.
+        let signal = ActiveMicrophoneApplication {
+            pid: 7,
+            bundle_id: "org.whispersystems.signal-desktop".into(),
+            name: "Signal".into(),
+        };
+        assert!(!signal.is_supported_meeting_app(false));
+        assert!(signal.is_supported_meeting_app(true));
+        let chrome = ActiveMicrophoneApplication {
+            pid: 8,
+            bundle_id: "com.google.Chrome".into(),
+            name: "Google Chrome".into(),
+        };
+        assert!(chrome.is_supported_meeting_app(false));
     }
 }

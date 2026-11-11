@@ -9,6 +9,7 @@ pub mod env;
 pub mod model;
 pub mod opencode;
 pub mod routing;
+pub mod user_dirs;
 pub mod util;
 
 use std::sync::Arc;
@@ -87,6 +88,12 @@ impl Router {
     /// the bundle's own `summary.md`, never rewritten).
     pub fn with_summary(self, summary: env::Summary) -> Self {
         self.with(|env| env.summary = Some(summary))
+    }
+
+    /// The host's way to OpenCode when this machine's registration isn't where it is (Windows:
+    /// a service in WSL). Without one the router reads this machine's registration.
+    pub fn with_opencode(self, opencode: Arc<dyn env::OpenCode>) -> Self {
+        self.with(|env| env.opencode = Some(opencode))
     }
 
     /// The `/sdk.js` registration for a tab, when the host serves `/sdk.js`.

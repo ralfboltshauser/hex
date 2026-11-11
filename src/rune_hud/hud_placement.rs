@@ -4,6 +4,7 @@
 //! capsule can place alike; `dictation_indicator` reads the metrics from
 //! `NSScreen` and applies the result.
 
+use crate::app_settings::IndicatorPosition;
 use crate::rune_hud::dot_scope::Placement;
 
 /// The plate's gap under the menu bar: as close as it sits and still
@@ -20,6 +21,9 @@ pub const ISLAND_PAD: f64 = 7.0;
 /// The island's room either side of the plate: the same as above and
 /// below it, so the field sits evenly in the island.
 pub const ISLAND_INSET: f64 = ISLAND_PAD;
+/// How far Labs' notch indicator widens the notch on each side: room for
+/// one glyph beside the camera, as the menu bar is tall.
+pub const EAR_WIDTH: f64 = 34.0;
 /// "Pretend notch" on a flat screen: a 14-inch MacBook Pro's notch width.
 const PRETEND_NOTCH_WIDTH: f64 = 185.0;
 
@@ -126,11 +130,15 @@ impl Default for Layout {
 
 /// A black island grown out of the notch: the notch's size, the island's
 /// open width, and the screen's top edge, from the window's middle, y down.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// `ears` keeps it the notch's height and widens it sideways only, with a
+/// glyph either side of the camera instead of Dot scope (Labs' notch
+/// indicator).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Island {
     pub notch: [f32; 2],
     pub width: f32,
     pub top: f32,
+    pub ears: bool,
 }
 
 impl Island {
@@ -236,12 +244,49 @@ pub fn place(placement: Placement, screen: &Screen, content: Content, bottom: bo
                         width: (notch.width + 2.0 * content.island_spread.max(0.0))
                             .min(window_width - 2.0) as f32,
                         top: -(window_height / 2.0) as f32,
+                        ears: false,
                     }),
                     ..Layout::default()
                 },
             )
         }
     }
+}
+
+/// Labs' notch indicator on `screen`: the notch widened by [`EAR_WIDTH`]
+/// on each side at the notch's own height, or `None` on a screen without
+/// a notch.
+pub fn ears(screen: &Screen, content: Content) -> Option<Placed> {
+    let notch = screen.notch()?;
+    let (window_width, window_height) = content.window;
+    Some(Placed {
+        top_left: (notch.x - window_width / 2.0, screen.frame.top()),
+        layout: Layout {
+            center: [0.0, (notch.height / 2.0 - window_height / 2.0) as f32],
+            island: Some(Island {
+                notch: [notch.width as f32, notch.height as f32],
+                width: (notch.width + 2.0 * EAR_WIDTH).min(window_width - 2.0) as f32,
+                top: -(window_height / 2.0) as f32,
+                ears: true,
+            }),
+            ..Layout::default()
+        },
+        over_menu_bar: true,
+    })
+}
+
+/// Labs' notch indicator when `lab` is on and the HUD is shown: [`ears`]'
+/// island on a notched screen, whatever the position setting, or `None`
+/// while Hidden or on a flat screen.
+pub fn notch_placement(
+    lab: bool,
+    position: IndicatorPosition,
+    screen: &Screen,
+    content: Content,
+) -> Option<Placed> {
+    (lab && position != IndicatorPosition::Hidden)
+        .then(|| ears(screen, content))
+        .flatten()
 }
 
 /// The placed plate's top and bottom edges in screen coordinates (y up),
@@ -379,6 +424,56 @@ mod tests {
         close(
             beside(Placement::Notch, &notched, false),
             (false, notched.safe_top + 2.0 * ISLAND_PAD + plate + 4.0),
+        );
+    }
+
+    #[test]
+    fn ears_widen_the_notch_sideways_at_its_own_height() {
+        assert_eq!(ears(&flat(), CONTENT), None);
+        let placed = ears(&notched(), CONTENT).expect("a notch");
+        let island = placed.layout.island.expect("an island");
+        assert!(island.ears);
+        assert_eq!(island.notch, [185.0, 32.0]);
+        assert_eq!(island.width, 185.0 + 2.0 * EAR_WIDTH as f32);
+        assert!(placed.over_menu_bar);
+        // Centred on the notch, hanging from the screen's top edge, the
+        // glyphs' middle halfway down the notch.
+        assert_eq!(placed.top_left, (756.0 - 160.0, 982.0));
+        assert_eq!(island.top, -64.0);
+        assert_eq!(plate(&placed).1, 982.0 - 16.0);
+        // A pretend notch counts as one.
+        assert!(ears(&flat().pretending_notch(), CONTENT).is_some());
+    }
+
+    #[test]
+    fn the_notch_indicator_wins_at_top_or_bottom_but_still_needs_a_notch() {
+        let placed =
+            |lab, position, screen: &Screen| notch_placement(lab, position, screen, CONTENT);
+        let ears = ears(&notched(), CONTENT);
+        assert_eq!(
+            placed(true, IndicatorPosition::Top, &notched()),
+            ears,
+            "the top setting keeps the island"
+        );
+        assert_eq!(
+            placed(true, IndicatorPosition::Bottom, &notched()),
+            ears,
+            "the bottom setting gets the island too"
+        );
+        assert_eq!(
+            placed(true, IndicatorPosition::Hidden, &notched()),
+            None,
+            "hidden still hides"
+        );
+        assert_eq!(
+            placed(true, IndicatorPosition::Top, &flat()),
+            None,
+            "a flat screen keeps its position setting"
+        );
+        assert_eq!(
+            placed(false, IndicatorPosition::Top, &notched()),
+            None,
+            "the lab off changes nothing"
         );
     }
 

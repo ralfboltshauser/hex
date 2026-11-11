@@ -20,8 +20,8 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 
 use crate::app_settings::AppSettings;
-use crate::desktop::activity::DesktopActivity;
-use crate::desktop::events::{EventReader, TranscriptPhase, VoiceEvent};
+use crate::desktop::activity::{DesktopActivity, last_completed_at};
+use crate::desktop::events::EventReader;
 use crate::desktop::host::{
     DesktopAction, DesktopListenerSnapshot, DesktopShortcuts, DesktopTranscriptionSnapshot,
 };
@@ -59,6 +59,8 @@ pub(crate) struct WindowsDesktopHost {
     activity: DesktopActivity,
     /// When the current session's newest dictation completed.
     last_completed_at: Option<u64>,
+    /// When this host started, so a previous session's failure is ignored.
+    started_at: u64,
     listener: Option<RunningListener>,
     session_before_start: Option<u64>,
     awaiting_session_start: bool,
@@ -77,6 +79,8 @@ pub(crate) struct WindowsDesktopHost {
     personal_commands_checked_at: Instant,
     preparation: TranscriptionPreparation,
     keyboard_switcher: crate::transcription::keyboard_model_switching::Switcher,
+    /// Labs › Switch model with app: the foreground app's mode choice.
+    app_switcher: crate::transcription::app_model_switching::Switcher,
     /// Present only while keyboard model switching is on.
     input_sources: Option<crate::keyboard_input_sources::Watcher>,
     /// The preparation running is a keyboard switch, which a manual choice
@@ -86,12 +90,44 @@ pub(crate) struct WindowsDesktopHost {
     /// The newest foreground window of another app, where the tray's Paste
     /// last dictation goes once its menu has taken the foreground.
     foreground: ForeignWindow,
+    /// The local API's `/dictations` controls, for whichever listener runs.
+    dictations: crate::dictation::service::DictationQueue,
 }
 
 /// Names the event that marks the running Hex app in this login session.
 const APP_INSTANCE_EVENT: &str = r"Local\anomaly.hex.app";
 
-/// Ownership of the one Hex app in this login session.
+/// The data root `HEX_APPLICATION_SUPPORT_DIR` names, unless it is the
+/// default one, which keeps the default event.
+fn custom_root() -> Option<std::path::PathBuf> {
+    let canonical = |path: std::path::PathBuf| path.canonicalize().unwrap_or(path);
+    let root = canonical(std::env::var_os("HEX_APPLICATION_SUPPORT_DIR")?.into());
+    let default = dirs::data_dir().map(|data| canonical(data.join("hex")));
+    (default.as_ref() != Some(&root)).then_some(root)
+}
+
+/// The instance event for a data root: [`APP_INSTANCE_EVENT`] for the
+/// default one, and its own event for another root that
+/// `HEX_APPLICATION_SUPPORT_DIR` names, so a copy of Hex with its own data,
+/// such as a benchmark, neither signals nor yields to the person's Hex.
+fn instance_event_name(custom_root: Option<&std::path::Path>) -> String {
+    use sha2::{Digest, Sha256};
+    match custom_root {
+        None => APP_INSTANCE_EVENT.into(),
+        Some(root) => {
+            // Windows paths compare without case.
+            let path = root.to_string_lossy().to_lowercase();
+            let digest = Sha256::digest(path.as_bytes());
+            let hash: String = digest[..8]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            format!("{APP_INSTANCE_EVENT}.{hash}")
+        }
+    }
+}
+
+/// Ownership of the one Hex app in this login session (per data root).
 ///
 /// Windows does not bring a running app forward when it is launched again, so
 /// a Start menu launch while the login item runs in the tray would start a
@@ -105,7 +141,8 @@ impl AppInstance {
     /// asking it to show its window unless this launch is a hidden (login)
     /// launch, which must never pop up an app that is already running.
     pub(crate) fn claim(start_hidden: bool) -> Result<Option<Self>> {
-        let name: Vec<u16> = APP_INSTANCE_EVENT.encode_utf16().chain([0]).collect();
+        let name = instance_event_name(custom_root().as_deref());
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
         // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call.
         let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
         if event.is_null() {
@@ -161,15 +198,15 @@ impl WindowsDesktopHost {
         settings_error: Option<String>,
         history: Option<History>,
         indicator: crate::rune_hud::HudSender,
+        dictations: crate::dictation::service::DictationQueue,
+        processing: crate::dictation::modes::ProcessingState,
     ) -> Self {
         crate::desktop::i18n::apply(settings.ui_language.as_deref());
         let mut event_reader = EventReader::open(&event_path);
         let mut activity = DesktopActivity::default();
         activity.refresh(&mut event_reader);
         let last_completed_at = last_completed_at(event_reader.events().iter());
-        let mode_runtime = Arc::new(RwLock::new(
-            crate::dictation::modes::ModeRuntime::from_settings(&settings),
-        ));
+        let started_at = crate::desktop::events::now_ms();
         // Known before the first poll, so launching keeps the saved model
         // instead of applying the current layout's mapping.
         let keyboard_switcher = crate::transcription::keyboard_model_switching::Switcher::new(
@@ -180,11 +217,22 @@ impl WindowsDesktopHost {
                 .then(crate::keyboard_input_sources::current)
                 .flatten(),
         );
+        // Known before the first poll, so launching keeps the saved model
+        // instead of applying the frontmost app's mode choice.
+        let app_switcher = crate::transcription::app_model_switching::Switcher::new(
+            settings.labs.app_model_switching,
+            settings
+                .labs
+                .app_model_switching
+                .then(|| crate::transcription::app_model_switching::startup_choice(&settings))
+                .flatten(),
+        );
         let mut host = Self {
             event_path,
             event_reader,
             activity,
             last_completed_at,
+            started_at,
             listener: None,
             session_before_start: None,
             awaiting_session_start: false,
@@ -196,16 +244,18 @@ impl WindowsDesktopHost {
             history,
             last_dictation: Arc::new(Mutex::new(None)),
             indicator,
-            mode_runtime,
-            transformations: Arc::new(crate::personal_commands::TransformationClient::default()),
+            mode_runtime: processing.modes,
+            transformations: processing.transformations,
             personal_commands: None,
             personal_commands_checked_at: Instant::now(),
             preparation: TranscriptionPreparation::default(),
             keyboard_switcher,
+            app_switcher,
             input_sources: None,
             automatic_preparation: false,
             updater: crate::updater::Updater::start(),
             foreground: ForeignWindow::default(),
+            dictations,
         };
         crate::transcription::models::delete_set_aside();
         host.refresh_personal_commands_host();
@@ -240,9 +290,13 @@ impl WindowsDesktopHost {
             Request::PasteLast => {
                 if let Some(listener) = &self.listener {
                     self.foreground.activate();
-                    let _ = listener
+                    if listener
                         .commands
-                        .send(crate::windows::dictation::ListenerCommand::PasteLast);
+                        .send(crate::windows::dictation::ListenerCommand::PasteLast)
+                        .is_ok()
+                    {
+                        crate::windows::dictation::wake();
+                    }
                 }
             }
             Request::Quit => return true,
@@ -301,6 +355,7 @@ impl WindowsDesktopHost {
                 .source_changed(source, Instant::now());
         }
         self.keyboard_switcher.manual_choice();
+        self.app_switcher.manual_choice();
         if self.automatic_preparation {
             self.preparation.cancel();
             self.automatic_preparation = false;
@@ -353,6 +408,46 @@ impl WindowsDesktopHost {
         }
     }
 
+    /// Follows the foreground app while switching is on, and starts the
+    /// installed-only preparation of a mode's speech choice once it is due.
+    /// Hex's own window and a moment with no window in front name no mode,
+    /// so they leave the last match and any switch it scheduled alone. The
+    /// host cannot see a listener recording, so a due switch is held only
+    /// while the shared engine's dictation streams or finishes run.
+    fn switch_with_app(&mut self) {
+        if !self.settings.labs.app_model_switching {
+            return;
+        }
+        let application = foreground_other_process_stem();
+        let now = Instant::now();
+        if self.app_switcher.observe(
+            crate::transcription::app_model_switching::Observation::frontmost(
+                application.as_deref(),
+            ),
+            |application| {
+                crate::transcription::app_model_switching::mode_choice(&self.settings, application)
+            },
+            now,
+        ) {
+            self.supersede_automatic();
+        }
+        if crate::transcription::engine::dictation_busy() {
+            return;
+        }
+        let Some(choice) = self
+            .app_switcher
+            .take_due(now, &self.settings.transcription)
+        else {
+            return;
+        };
+        let selection = crate::transcription::models::TranscriptionSelection {
+            language: choice.language,
+            ..self.settings.transcription_for_model(choice.model)
+        };
+        self.preparation.start(selection, true);
+        self.automatic_preparation = true;
+    }
+
     fn model_ready(&self) -> bool {
         let model = crate::transcription::models::definition(self.settings.transcription.model);
         crate::transcription::models::is_installed(model, &self.settings.transcription.language)
@@ -379,6 +474,7 @@ impl WindowsDesktopHost {
         let config = crate::windows::dictation::WindowsDictationConfig {
             swap_failures: Some(swap_failure_sender),
             commands: Some(command_receiver),
+            dictations: self.dictations.clone(),
             history: self.history.clone(),
             last_dictation: self.last_dictation.clone(),
             indicator: Some(self.indicator.clone()),
@@ -464,6 +560,12 @@ impl WindowsDesktopHost {
             self.supersede_automatic();
         }
         let previous = std::mem::replace(&mut self.settings, settings.clone());
+        if self
+            .app_switcher
+            .configure(settings.labs.app_model_switching)
+        {
+            self.supersede_automatic();
+        }
         let current = settings;
         crate::feedback::set_enabled(current.sound_effects);
         crate::feedback::set_volume(current.sound_effect_volume.clamp(0.0, 1.0));
@@ -561,6 +663,7 @@ impl WindowsDesktopHost {
 
     pub(crate) fn refresh(&mut self) {
         self.switch_with_keyboard();
+        self.switch_with_app();
         if let Some(result) = self.preparation.poll() {
             self.automatic_preparation = false;
             let result = result.and_then(|selection| {
@@ -656,9 +759,13 @@ impl WindowsDesktopHost {
             activity: self.activity.state,
             listener: DesktopListenerSnapshot {
                 running: self.is_running(),
+                warming: self.is_running() && self.awaiting_session_start,
                 status: self.status.clone(),
-                warning: visible_failure(&self.activity, self.last_completed_at)
-                    .or_else(|| self.indicator.failure()),
+                warning: self.indicator.failure(),
+                last_failure: self
+                    .activity
+                    .visible_failure_since(self.started_at, self.last_completed_at),
+                notice: None,
                 shortcuts: DesktopShortcuts::Registered,
                 shortcuts_configurable: false,
             },
@@ -674,6 +781,7 @@ impl WindowsDesktopHost {
             },
             update_status: self.updater.status(),
             update_notes: self.updater.notes(),
+            update_blocked: self.updater.blocked(),
             settings: self.settings.clone(),
             state: self.activity.state.filter(|_| self.is_running()),
         }
@@ -689,26 +797,30 @@ impl Drop for WindowsDesktopHost {
     }
 }
 
-/// When the current session's newest dictation completed. `events` is
-/// oldest first, as `EventReader` keeps them.
-fn last_completed_at<'a>(events: impl DoubleEndedIterator<Item = &'a VoiceEvent>) -> Option<u64> {
-    for event in events.rev() {
-        match event {
-            VoiceEvent::SessionStarted { .. } => return None,
-            VoiceEvent::Transcript {
-                timestamp_ms,
-                phase: TranscriptPhase::Completed,
-                text,
-                ..
-            } if !text.trim().is_empty() => return Some(*timestamp_ms),
-            _ => {}
+/// The foreground application's executable stem, or `None` when Hex owns the
+/// foreground window or none is focused: Labs › Switch model with app matches
+/// applications only, never Hex's own window.
+pub(crate) fn foreground_other_process_stem() -> Option<String> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    // SAFETY: plain queries; a null window owns no process.
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_null() {
+            return None;
         }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, &mut process_id);
+        if process_id == GetCurrentProcessId() {
+            return None;
+        }
+        let path = crate::windows::input::window_process_path(window)?;
+        Some(path.file_stem()?.to_string_lossy().to_lowercase())
     }
-    None
 }
 
-/// The newest failure, hidden once a later dictation completed, so a silent
-/// failure still reaches the Settings window without sticking around.
 /// The newest foreground window another process owns, polled with the
 /// runtime's refresh.
 #[derive(Default)]
@@ -748,14 +860,6 @@ impl ForeignWindow {
     }
 }
 
-fn visible_failure(activity: &DesktopActivity, last_completed_at: Option<u64>) -> Option<String> {
-    activity
-        .last_failure
-        .as_ref()
-        .filter(|(failed_at, _)| last_completed_at.is_none_or(|completed| completed < *failed_at))
-        .map(|(_, message)| message.clone())
-}
-
 #[cfg(not(test))]
 fn save_listening(settings: &AppSettings) -> Result<()> {
     settings.save()
@@ -771,41 +875,19 @@ fn save_listening(_: &AppSettings) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn transcript(timestamp_ms: u64, text: &str) -> VoiceEvent {
-        VoiceEvent::Transcript {
-            timestamp_ms,
-            phase: TranscriptPhase::Completed,
-            latency_ms: 10,
-            text: text.into(),
-        }
-    }
-
     #[test]
-    fn the_newest_completion_is_scoped_to_the_current_session() {
-        let events = [
-            transcript(1, "Old session"),
-            VoiceEvent::SessionStarted { timestamp_ms: 2 },
-        ];
-        assert_eq!(last_completed_at(events.iter()), None);
-        let events = [
-            VoiceEvent::SessionStarted { timestamp_ms: 2 },
-            transcript(3, "First"),
-            transcript(4, "Second"),
-            transcript(5, "  "),
-        ];
-        assert_eq!(last_completed_at(events.iter()), Some(4));
-    }
-
-    #[test]
-    fn newest_failure_shows_until_a_later_transcript_completes() {
-        let activity = DesktopActivity {
-            last_failure: Some((5, "OpenCode generation failed".into())),
-            ..DesktopActivity::default()
-        };
+    fn an_isolated_data_root_has_its_own_instance_event() {
+        assert_eq!(instance_event_name(None), APP_INSTANCE_EVENT);
+        let isolated = instance_event_name(Some(std::path::Path::new(r"C:\bench\home\hex")));
+        assert!(isolated.starts_with(r"Local\anomaly.hex.app."));
+        assert_eq!(isolated.len(), APP_INSTANCE_EVENT.len() + 17);
         assert_eq!(
-            visible_failure(&activity, Some(4)).as_deref(),
-            Some("OpenCode generation failed")
+            isolated,
+            instance_event_name(Some(std::path::Path::new(r"c:\Bench\Home\HEX")))
         );
-        assert_eq!(visible_failure(&activity, Some(6)), None);
+        assert_ne!(
+            isolated,
+            instance_event_name(Some(std::path::Path::new(r"C:\bench\other\hex")))
+        );
     }
 }

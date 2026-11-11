@@ -93,13 +93,16 @@ impl LinuxIndicator {
         self.recording = recording;
     }
 
-    /// The oldest submitted dictation finished: pasted, or failed.
-    pub(crate) fn finished(&mut self, pasted: bool) {
+    /// The oldest submitted dictation finished: pasted, or failed with why.
+    pub(crate) fn finished(&mut self, failure: Option<&str>) {
         if let Some(job_id) = self.jobs.pop_front() {
-            self.send(if pasted {
-                HudEvent::JobCompleted { job_id }
+            self.send(if let Some(message) = failure {
+                HudEvent::JobFailed {
+                    job_id,
+                    message: Some(message.to_owned()),
+                }
             } else {
-                HudEvent::JobFailed { job_id }
+                HudEvent::JobCompleted { job_id }
             });
         }
     }
@@ -199,7 +202,7 @@ fn display_limitation() -> Option<Limitation> {
     None
 }
 
-const LAYER_SHELL: &str = "zwlr_layer_shell_v1";
+pub(crate) const LAYER_SHELL: &str = "zwlr_layer_shell_v1";
 
 /// Whether a Wayland connection opens at all, so a missing display is never
 /// read as a compositor without layer-shell.

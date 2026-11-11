@@ -209,8 +209,15 @@ pub fn start_global_input_tap(_telemetry: Arc<SharedCaptureTelemetry>) {}
 
 /// `(width, height)` with the long edge at most `edge`, both multiples of `step`.
 fn fit(width: u32, height: u32, edge: u32, step: u32) -> (u32, u32) {
-    let scale = (f64::from(edge) / f64::from(width.max(height).max(1))).min(1.0);
-    let round = |v: u32| (((f64::from(v) * scale) as u32) / step * step).max(step);
+    let long = width.max(height).max(1);
+    if long <= edge {
+        return (
+            (width / step * step).max(step),
+            (height / step * step).max(step),
+        );
+    }
+    let scale = f64::from(edge) / f64::from(long);
+    let round = |v: u32| (((f64::from(v) * scale).round() as u32) / step * step).max(step);
     (round(width), round(height))
 }
 
@@ -246,6 +253,11 @@ pub fn recorded_screen() -> Option<(u32, u32)> {
 /// shows the screen is scaled.
 static RECORDED_POINTS: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
 
+/// The output the portal says it records, by its connector name (`mapping_id`, such as
+/// `DP-3`), while a screen recording runs. Only some portals name it, and only for a monitor
+/// pick; a window has no output.
+static RECORDED_OUTPUT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// The size of the screen being recorded in the desktop's logical points, as the screen-cast
 /// portal reported it (Wayland). A host drawing over the screen uses it rather than dividing
 /// the pixels by its own scale, which a fractional scale (1.5, 1.33) rounds up to a whole
@@ -254,6 +266,15 @@ pub fn recorded_screen_points() -> Option<(f64, f64)> {
     *RECORDED_POINTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The Wayland output the portal records, by connector name, while a screen recording runs.
+/// `None` when the portal didn't name one.
+pub fn recorded_output() -> Option<String> {
+    RECORDED_OUTPUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// The screen's logical size from the portal's stream `size`, when it is smaller than the
@@ -276,6 +297,9 @@ pub(super) fn run_sampler(sampler: Sampler) -> Option<super::Movie> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     *RECORDED_POINTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *RECORDED_OUTPUT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     match recorded {
@@ -341,34 +365,38 @@ fn record(sampler: &Sampler) -> Result<Option<super::Movie>> {
             Some((format.width, format.height));
         let points = logical_screen(cast.size, (format.width, format.height));
         scrawl_log(format!(
-            "Screen size from the portal: {:?}, in points: {points:?}",
-            cast.size
+            "Screen size from the portal: {:?}, in points: {points:?}, output: {:?}",
+            cast.size, cast.mapping_id
         ));
         *RECORDED_POINTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = points;
+        *RECORDED_OUTPUT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cast.mapping_id.clone();
     }
     let edge = if source == Source::Window {
         WINDOW_EDGE
     } else {
         SCREEN_EDGE
     };
-    let out = fit(format.width, format.height, edge, 16);
+    let out = fit(format.width, format.height, edge, 2);
     // The video engine shrinks by at most 4× in one pass (radeonsi crashes past it), so the
     // candidates come from the movie's frame at no less than a quarter of its size.
     let small_edge = (CANDIDATE_EDGE as u32).max(out.0.max(out.1).div_ceil(4));
     let small = fit(out.0, out.1, small_edge, 2);
     scrawl_log(format!(
-        "Recording {}x{} of {}x{} ({:?}, {})",
+        "Recording {}x{} of {}x{} ({:?}, {:?}, {})",
         out.0,
         out.1,
         format.width,
         format.height,
         source,
+        format.pixel,
         if format.dmabuf {
-            "DMA-BUF"
+            format!("DMA-BUF, modifier {:#x}", format.modifier)
         } else {
-            "shared memory"
+            "shared memory".to_owned()
         }
     ));
     let path = sampler.video_output_path.clone();
@@ -386,9 +414,38 @@ fn record(sampler: &Sampler) -> Result<Option<super::Movie>> {
             scrawl_log(format!("The screen stream stopped: {why}"));
             break;
         }
+        let mut fresh_frame = false;
         if let Some(frame) = stream.newest() {
-            match load(&mut encoding, &frame, &format) {
-                Ok(()) => have_frame = true,
+            let mut loaded = load(&mut encoding, &frame, &format);
+            // The GPU can encode but refused this screen's buffers (some drivers won't import
+            // the producer's layout): copy the frames on the CPU instead of failing.
+            let refused = match (&loaded, &encoding) {
+                (Err(error), Encoding::Hardware { .. }) if !have_frame => {
+                    Some(format!("{error:#}"))
+                }
+                _ => None,
+            };
+            if let Some(why) = refused {
+                scrawl_log(format!(
+                    "Hardware encoding refused the screen buffer, encoding on the CPU: {why}"
+                ));
+                // The muxer ends before x264 writes the same movie.
+                drop(std::mem::replace(
+                    &mut encoding,
+                    Encoding::Software {
+                        pixels: Vec::new(),
+                        movie: None,
+                        hardware: None,
+                    },
+                ));
+                encoding = software_encoding(&format, out, path.as_deref(), Some(why));
+                loaded = load(&mut encoding, &frame, &format);
+            }
+            match loaded {
+                Ok(()) => {
+                    have_frame = true;
+                    fresh_frame = true;
+                }
                 // Nothing of the screen recorded yet: end the capture with why rather than
                 // write one with no picture.
                 Err(error) if !have_frame => {
@@ -408,14 +465,30 @@ fn record(sampler: &Sampler) -> Result<Option<super::Movie>> {
                     sampler.started_at.elapsed().as_millis() as u64,
                 )
             });
-            let due = (start.elapsed().as_secs_f64() * f64::from(FPS)) as u64 + 1;
-            while written < due {
-                if let Err(error) = encode(&mut encoding) {
-                    scrawl_log(format!("Encoding failed: {error:#}"));
-                    failed = true;
-                    break;
+            match &encoding {
+                Encoding::Hardware { .. } => {
+                    let due = (start.elapsed().as_secs_f64() * f64::from(FPS)) as u64 + 1;
+                    while written < due {
+                        if let Err(error) = encode(&mut encoding) {
+                            scrawl_log(format!("Encoding failed: {error:#}"));
+                            failed = true;
+                            break;
+                        }
+                        written += 1;
+                    }
                 }
-                written += 1;
+                // `Writer::x264` timestamps raw frames on the wall clock and expands to `FPS`
+                // inside ffmpeg, avoiding multi-GB/s duplicate pipe writes when a frame is still
+                // or a 4K software frame runs past one 16.7 ms tick.
+                Encoding::Software { .. } if fresh_frame => {
+                    if let Err(error) = encode(&mut encoding) {
+                        scrawl_log(format!("Encoding failed: {error:#}"));
+                        failed = true;
+                    } else {
+                        written += 1;
+                    }
+                }
+                Encoding::Software { .. } => {}
             }
         }
         let urgent = sampler.urgent.swap(false, Ordering::AcqRel);
@@ -427,7 +500,7 @@ fn record(sampler: &Sampler) -> Result<Option<super::Movie>> {
         if have_frame && (urgent || last_sample.is_none_or(|at| at.elapsed() >= interval)) {
             last_sample = Some(Instant::now());
             let t_ms = sampler.started_at.elapsed().as_millis() as u64;
-            if let Some(frame) = candidate(&encoding, &format, small, t_ms) {
+            if let Some(frame) = candidate(&mut encoding, &format, small, t_ms) {
                 sampler
                     .frames
                     .lock()
@@ -436,6 +509,15 @@ fn record(sampler: &Sampler) -> Result<Option<super::Movie>> {
             }
         }
         std::thread::park_timeout(tick / 2);
+    }
+    if have_frame && !failed && matches!(encoding, Encoding::Software { .. }) {
+        let _ = encode(&mut encoding);
+    }
+    if let Some((start, _)) = first {
+        scrawl_log(format!(
+            "Recorded {written} frames in {} ms",
+            start.elapsed().as_millis()
+        ));
     }
     drop(stream);
     drop(cast);
@@ -478,6 +560,7 @@ fn record_x11(sampler: &Sampler) -> Result<Option<super::Movie>> {
         width: u32::from(rect.width),
         height: u32::from(rect.height),
         dmabuf: false,
+        modifier: pipewire::MODIFIER_LINEAR,
     };
     if area.is_none() {
         *RECORDED
@@ -488,7 +571,7 @@ fn record_x11(sampler: &Sampler) -> Result<Option<super::Movie>> {
     let out = fit(format.width, format.height, SCREEN_EDGE, 2);
     let small = fit(out.0, out.1, CANDIDATE_EDGE as u32, 2);
     let path = sampler.video_output_path.clone();
-    let movie = match path.as_deref() {
+    let mut movie = match path.as_deref() {
         Some(path) => Some(
             Writer::x264(path, "bgr0", (format.width, format.height), out)
                 .context("could not start ffmpeg's x264 encoder")?,
@@ -499,27 +582,19 @@ fn record_x11(sampler: &Sampler) -> Result<Option<super::Movie>> {
         "Recording {}x{} of {}x{} at {},{} (X11)",
         out.0, out.1, format.width, format.height, rect.x, rect.y
     ));
-    let mut encoding = Encoding::Software {
-        pixels: Vec::new(),
-        movie,
-        hardware: None,
-    };
     crate::log::start_metric("sck_ready_ms", sampler.started_at);
-    let tick = Duration::from_secs(1) / FPS;
     let start = Instant::now();
     let offset_ms = sampler.started_at.elapsed().as_millis() as u64;
-    let mut written = 0_u64;
     let mut last_sample: Option<Instant> = None;
+    let mut grabs = 0_u64;
     while !sampler.stopping.load(Ordering::Acquire) {
-        if let Encoding::Software { pixels, .. } = &mut encoding {
-            grabber
-                .grab(pixels)
-                .context("the X server stopped giving the screen")?;
-        }
-        let due = (start.elapsed().as_secs_f64() * f64::from(FPS)) as u64 + 1;
-        while written < due {
-            encode(&mut encoding).context("ffmpeg stopped taking frames")?;
-            written += 1;
+        let tick_index = (start.elapsed().as_nanos() as u64 * u64::from(FPS)) / 1_000_000_000;
+        let pixels = grabber
+            .grab()
+            .context("the X server stopped giving the screen")?;
+        grabs += 1;
+        if let Some(movie) = &mut movie {
+            std::io::Write::write_all(movie, pixels).context("ffmpeg stopped taking frames")?;
         }
         let urgent = sampler.urgent.swap(false, Ordering::AcqRel);
         let interval = sampler
@@ -530,7 +605,7 @@ fn record_x11(sampler: &Sampler) -> Result<Option<super::Movie>> {
         if urgent || last_sample.is_none_or(|at| at.elapsed() >= interval) {
             last_sample = Some(Instant::now());
             let t_ms = sampler.started_at.elapsed().as_millis() as u64;
-            if let Some(frame) = candidate(&encoding, &format, small, t_ms) {
+            if let Some(frame) = sample_rgba(pixels, &format, small, t_ms) {
                 sampler
                     .frames
                     .lock()
@@ -538,13 +613,22 @@ fn record_x11(sampler: &Sampler) -> Result<Option<super::Movie>> {
                     .push(frame, urgent);
             }
         }
-        let next = start + tick * u32::try_from(written).unwrap_or(u32::MAX);
+        let next_ns = ((tick_index + 1) * 1_000_000_000).div_ceil(u64::from(FPS));
+        let next = start + Duration::from_nanos(next_ns);
         std::thread::park_timeout(next.saturating_duration_since(Instant::now()));
     }
-    let Encoding::Software {
-        movie: Some(movie), ..
-    } = encoding
-    else {
+    if grabs > 0
+        && let Some(movie) = &mut movie
+        && let Ok(pixels) = grabber.grab()
+    {
+        let _ = std::io::Write::write_all(movie, pixels);
+        grabs += 1;
+    }
+    scrawl_log(format!(
+        "Recorded {grabs} frames in {} ms (X11)",
+        start.elapsed().as_millis()
+    ));
+    let Some(movie) = movie else {
         return Ok(None);
     };
     let Some(path) = path else {
@@ -564,8 +648,13 @@ fn start_encoding(
     if format.dmabuf
         && let Some(path) = path
     {
-        let hardware = Encoder::new((format.width, format.height), format.pixel, out, small)
-            .and_then(|encoder| Ok((encoder, Writer::h264(path)?)));
+        let hardware = Encoder::new(
+            (format.width, format.height),
+            (format.pixel, format.modifier),
+            out,
+            small,
+        )
+        .and_then(|encoder| Ok((encoder, Writer::h264(path)?)));
         match hardware {
             Ok((encoder, movie)) => {
                 return Encoding::Hardware {
@@ -579,6 +668,17 @@ fn start_encoding(
             }
         }
     }
+    software_encoding(format, out, path, unavailable)
+}
+
+/// x264 on the CPU, from frames copied out of the stream; `hardware` says why the GPU
+/// isn't encoding, when it was tried.
+fn software_encoding(
+    format: &VideoFormat,
+    out: (u32, u32),
+    path: Option<&std::path::Path>,
+    hardware: Option<String>,
+) -> Encoding {
     let pixel = match format.pixel {
         PixelFormat::Bgrx => "bgr0",
         PixelFormat::Rgbx => "rgb0",
@@ -593,7 +693,7 @@ fn start_encoding(
     Encoding::Software {
         pixels: Vec::new(),
         movie,
-        hardware: unavailable,
+        hardware,
     }
 }
 
@@ -605,7 +705,16 @@ fn load(encoding: &mut Encoding, frame: &Frame, format: &VideoFormat) -> Result<
         } => {
             let row = format.width as usize * 4;
             pixels.resize(row * format.height as usize, 0);
-            let rows = match (frame.rows(row, format.height as usize), hardware.as_deref()) {
+            // A tiled GPU buffer's bytes aren't rows; the CPU must not read it as if they were.
+            let readable = if frame.dmabuf && format.modifier != pipewire::MODIFIER_LINEAR {
+                Err(anyhow::anyhow!(
+                    "the screen's GPU buffers are tiled (modifier {:#x}), which the CPU can't read",
+                    format.modifier
+                ))
+            } else {
+                frame.rows(row, format.height as usize)
+            };
+            let rows = match (readable, hardware.as_deref()) {
                 (Ok(rows), _) => rows,
                 (Err(error), None) => return Err(error),
                 (Err(error), Some(why)) => {
@@ -639,9 +748,9 @@ fn encode(encoding: &mut Encoding) -> Result<()> {
 }
 
 fn candidate(
-    encoding: &Encoding,
+    encoding: &mut Encoding,
     format: &VideoFormat,
-    (width, height): (u32, u32),
+    size: (u32, u32),
     t_ms: u64,
 ) -> Option<RgbaFrame> {
     match encoding {
@@ -649,30 +758,40 @@ fn candidate(
             let (w, h, rgba) = encoder.small_rgba()?;
             Some(RgbaFrame::new(t_ms, w, h, rgba))
         }
-        Encoding::Software { pixels, .. } if !pixels.is_empty() => {
-            let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-            for y in 0..height {
-                let sy = (u64::from(y) * u64::from(format.height) / u64::from(height)) as usize;
-                for x in 0..width {
-                    let sx = (u64::from(x) * u64::from(format.width) / u64::from(width)) as usize;
-                    let at = (sy * format.width as usize + sx) * 4;
-                    let p = &pixels[at..at + 4];
-                    if format.pixel.bgr() {
-                        rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
-                    } else {
-                        rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
-                    }
-                }
-            }
-            Some(RgbaFrame::new(t_ms, width, height, rgba))
-        }
-        Encoding::Software { .. } => None,
+        Encoding::Software { pixels, .. } => sample_rgba(pixels, format, size, t_ms),
     }
+}
+
+fn sample_rgba(
+    pixels: &[u8],
+    format: &VideoFormat,
+    (width, height): (u32, u32),
+    t_ms: u64,
+) -> Option<RgbaFrame> {
+    if pixels.len() < format.width as usize * format.height as usize * 4 {
+        return None;
+    }
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        let sy = (u64::from(y) * u64::from(format.height) / u64::from(height)) as usize;
+        for x in 0..width {
+            let sx = (u64::from(x) * u64::from(format.width) / u64::from(width)) as usize;
+            let at = (sy * format.width as usize + sx) * 4;
+            let p = &pixels[at..at + 4];
+            if format.pixel.bgr() {
+                rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
+            } else {
+                rgba.extend_from_slice(&[p[0], p[1], p[2], 255]);
+            }
+        }
+    }
+    Some(RgbaFrame::new(t_ms, width, height, rgba))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::logical_screen;
+    use super::{SCREEN_EDGE, WINDOW_EDGE, fit, logical_screen};
+    use crate::linux::media::x264_preset;
 
     #[test]
     fn a_fractionally_scaled_screen_keeps_its_logical_size() {
@@ -690,5 +809,22 @@ mod tests {
         assert_eq!(logical_screen(Some((3840, 2160)), (3840, 2160)), None);
         assert_eq!(logical_screen(Some((1440, 2560)), (3840, 2160)), None);
         assert_eq!(logical_screen(Some((0, 0)), (3840, 2160)), None);
+    }
+
+    #[test]
+    fn output_sizes_stay_exact_even_dimensions_without_16px_truncation() {
+        assert_eq!(fit(1920, 1080, SCREEN_EDGE, 2), (1920, 1080));
+        assert_eq!(fit(2560, 1440, SCREEN_EDGE, 2), (2560, 1440));
+        assert_eq!(fit(3840, 2160, SCREEN_EDGE, 2), (2560, 1440));
+        assert_eq!(fit(1915, 1043, WINDOW_EDGE, 2), (1914, 1042));
+    }
+
+    #[test]
+    fn cpu_x264_uses_superfast_up_to_1440p_and_ultrafast_above() {
+        assert_eq!(x264_preset((1920, 1080), (1920, 1080)), "superfast");
+        assert_eq!(x264_preset((2560, 1440), (2560, 1440)), "superfast");
+        assert_eq!(x264_preset((1440, 2560), (1440, 2560)), "superfast");
+        assert_eq!(x264_preset((2560, 1600), (2560, 1600)), "ultrafast");
+        assert_eq!(x264_preset((3840, 2160), (2560, 1440)), "ultrafast");
     }
 }

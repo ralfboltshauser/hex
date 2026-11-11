@@ -5,29 +5,35 @@
 use rune::{El, col, el, row, text};
 
 use super::facts::{
-    self as facts, Entry, State, compact_progress, errors, errors_heading, errors_label, tnum,
+    self as facts, Entry, State, errors, errors_heading, errors_label, progress_line, tnum,
 };
 use super::{self as picker, View};
 use crate::desktop::i18n::{tr, tr_fill};
 use crate::rune_ui::Ui;
 use crate::rune_ui::controls::Paint;
-use crate::transcription::models::Recommendation;
+use crate::transcription::models::{Recommendation, TranscriptionModelId};
 
 pub(super) const WIDTH: f32 = 800.0;
 const LABEL: f32 = 156.0;
 const PAD: f32 = 24.0;
 const HEAD: f32 = 124.0;
 const ROW: f32 = 40.0;
-const ACTION: f32 = 64.0;
+const ACTION: f32 = 48.0;
 const COLUMNS: usize = 3;
 
 /// The columns: the first three models that speak the language, with the
 /// one being prepared, else the one in use, in the last place when the
-/// three leave it out.
-fn columns(entries: &[Entry]) -> Vec<&Entry> {
-    let mut shown: Vec<&Entry> = entries
-        .iter()
-        .filter(|entry| entry.supports)
+/// three leave it out. `first` (Labs › Model in use first) takes the first
+/// column and the rest follow without it.
+fn columns(entries: &[Entry], first: Option<TranscriptionModelId>) -> Vec<&Entry> {
+    let pinned = first.and_then(|id| entries.iter().find(|entry| entry.def.id == id));
+    let mut shown: Vec<&Entry> = pinned
+        .into_iter()
+        .chain(
+            entries
+                .iter()
+                .filter(|entry| entry.supports && Some(entry.def.id) != first),
+        )
         .take(COLUMNS)
         .collect();
     let left_out = |entry: &&Entry| shown.iter().all(|column| column.def.id != entry.def.id);
@@ -145,18 +151,6 @@ fn measures(ui: &Ui, shown: &[&Entry], language: &str) -> Vec<Measure> {
             .map(|entry| facts::reads_vocabulary(ui, entry.def).then_some(1.0))
             .collect(),
     });
-    measures.push(Measure {
-        key: "download",
-        label: tr("Download"),
-        values: shown
-            .iter()
-            .map(|entry| facts::download_label(entry))
-            .collect(),
-        scores: shown
-            .iter()
-            .map(|entry| Some(-(facts::to_download(entry) as f64)))
-            .collect(),
-    });
     measures
 }
 
@@ -175,7 +169,7 @@ fn cell(p: Paint, key: &str, height: f32, content: El) -> El {
 
 pub(super) fn body(ui: &Ui, p: Paint, entries: &[Entry], language: &str) -> El {
     let c = &p.k.c;
-    let shown = columns(entries);
+    let shown = columns(entries, picker::pinned(ui));
     let measures = measures(ui, &shown, language);
     let width = (WIDTH - 2.0 * p.hair - 2.0 * PAD - LABEL) / shown.len().max(COLUMNS) as f32;
 
@@ -200,7 +194,18 @@ pub(super) fn body(ui: &Ui, p: Paint, entries: &[Entry], language: &str) -> El {
     let mut table = row().key("compare").px(PAD).pt(8.0).child(labels);
     for (index, entry) in shown.iter().enumerate() {
         let recommended = entry.recommendation == Some(Recommendation::Recommended);
-        let eyebrow = facts::role(ui, entry, &shown).unwrap_or("");
+        // An eyebrow that a row's bold value already says goes.
+        let eyebrow = match facts::role(ui, entry, &shown) {
+            Some((_, Some(key)))
+                if measures
+                    .iter()
+                    .any(|measure| measure.key == key && measure.best() == Some(index)) =>
+            {
+                ""
+            }
+            Some((label, _)) => label,
+            None => "",
+        };
         let head = col()
             .key("head")
             .h(HEAD)
@@ -226,8 +231,11 @@ pub(super) fn body(ui: &Ui, p: Paint, entries: &[Entry], language: &str) -> El {
                     .color(p.muted())
                     .wrap(),
             );
+        // A group named by its model, so its action reads with it.
         let mut column = col()
             .key(format!("model{index}"))
+            .role("group")
+            .label(entry.def.name)
             .w(width)
             .radius(p.k.radius.lg)
             .child(head);
@@ -250,7 +258,7 @@ pub(super) fn body(ui: &Ui, p: Paint, entries: &[Entry], language: &str) -> El {
         }
         let action = match &entry.state {
             State::InUse => facts::in_use(p),
-            State::Preparing { .. } => compact_progress(p, entry),
+            State::Preparing { .. } => progress_line(p, entry),
             _ if entry.def.available() => facts::choose_button(p, entry, primary == Some(index)),
             _ => el(),
         };
@@ -319,6 +327,42 @@ mod tests {
             values: Vec::new(),
             scores: scores.to_vec(),
         }
+    }
+
+    fn entries(language: &str) -> Vec<Entry> {
+        crate::transcription::models::picker_models(language)
+            .into_iter()
+            .map(|(def, recommendation)| Entry {
+                def,
+                recommendation,
+                supports: def.supports_language(language),
+                state: State::NotDownloaded,
+            })
+            .collect()
+    }
+
+    fn ids(shown: &[&Entry]) -> Vec<TranscriptionModelId> {
+        shown.iter().map(|entry| entry.def.id).collect()
+    }
+
+    #[test]
+    fn the_model_in_use_takes_the_first_column_only_when_pinned() {
+        let entries = entries("en");
+        let speaking: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.supports)
+            .map(|entry| entry.def.id)
+            .collect();
+        assert!(speaking.len() > COLUMNS);
+        assert_eq!(ids(&columns(&entries, None)), speaking[..COLUMNS]);
+        let pinned = *speaking.last().unwrap();
+        let shown = ids(&columns(&entries, Some(pinned)));
+        let mut expected = vec![pinned];
+        expected.extend_from_slice(&speaking[..COLUMNS - 1]);
+        assert_eq!(shown, expected);
+        // Already among the first three: it moves to the front.
+        let shown = ids(&columns(&entries, Some(speaking[1])));
+        assert_eq!(shown, [speaking[1], speaking[0], speaking[2]]);
     }
 
     #[test]

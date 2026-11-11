@@ -834,8 +834,9 @@ pub(super) fn refine(
 }
 
 /// Corrects a finished meeting's live boundaries once and records them.
-/// The Markdown heading follows a title the new chapters change. Failures
-/// leave the live chapters in place.
+/// The Markdown heading, and with its lab the exported file's name, follows
+/// a title the new chapters change. Failures leave the live chapters in
+/// place.
 /// Each call first yields to dictation; a stop or quit ends the pass
 /// without recording anything, so the next notes run redoes it.
 pub(super) fn refine_meeting(directory: &Path, entries: &[TranscriptEntry], stop: &AtomicBool) {
@@ -900,7 +901,7 @@ fn refine_meeting_with(
     }
 }
 
-fn retitle_export(manifest: &mut MeetingManifest, previous: &str) {
+pub(super) fn retitle_export(manifest: &mut MeetingManifest, previous: &str) {
     let title = display_title(manifest);
     if title != previous
         && let Some(path) = manifest.export_path.clone().filter(|path| path.exists())
@@ -912,6 +913,14 @@ fn retitle_export(manifest: &mut MeetingManifest, previous: &str) {
         )
     {
         tracing::warn!(%error, meeting = manifest.id, "could not retitle meeting Markdown");
+    }
+    if title != previous {
+        super::export_name::rename_to_title(
+            manifest,
+            &title,
+            crate::labs::meeting_descriptive_filenames(),
+        );
+        super::notes_file::refresh(manifest);
     }
 }
 

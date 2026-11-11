@@ -4,9 +4,16 @@
 //! authenticated HTTP over `TcpStream`. Hex never runs an OpenCode
 //! executable; when no service answers, OpenCode isn't running, and when
 //! one answers `/api/info` with 404 it predates the current OpenCode 2.
+//!
+//! On Windows, Labs › OpenCode in WSL also reads the default WSL
+//! distribution's registration when no Windows one answers; that service
+//! gets Hex's workspace as a Linux path.
 
+mod wsl;
+
+use self::wsl::WslHome;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,14 +31,17 @@ const MAX_REGISTRATIONS: usize = 16;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const INFO_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_DEADLINE: Duration = Duration::from_secs(2);
-/// How often a blocked read checks cancellation and the deadline.
-const READ_SLICE: Duration = Duration::from_millis(50);
+/// How often a stalled read or write checks cancellation and the deadline.
+const WAIT_SLICE: Duration = Duration::from_millis(50);
+const WRITE_CHUNK: usize = 64 * 1024;
 
 /// One running service: where it listens and how to authenticate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Service {
     address: SocketAddr,
     password: Option<String>,
+    /// Set when the registration lives in WSL's filesystem (Windows).
+    wsl: Option<WslHome>,
 }
 
 #[derive(Debug)]
@@ -59,9 +69,69 @@ impl Missing {
 }
 
 /// The running service, or why there is none. Reads only registration files
-/// and asks each registered service for `/api/info`.
+/// and asks each registered service for `/api/info`. On Windows it also
+/// looks in WSL while Labs › OpenCode in WSL is on.
 pub(crate) fn find() -> Result<Service, Missing> {
-    find_in(&state_dir().ok_or(Missing::NotRunning)?)
+    let found = match state_dir() {
+        Some(state) => find_in(&state),
+        None => Err(Missing::NotRunning),
+    };
+    with_wsl(found, None, &AtomicBool::new(false))
+}
+
+/// [`find`] within the caller's own budget: every `/api/info` confirmation
+/// shares `deadline` (still capped by [`INFO_DEADLINE`]) and stops when
+/// `cancelled` is set, so a rewrite never waits past its deadline here. The
+/// WSL fallback gets only what the Windows search has left.
+pub(crate) fn find_cancellable(
+    deadline: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Service, Missing> {
+    let started = Instant::now();
+    let found = match state_dir() {
+        Some(state) => find_in_cancellable(&state, deadline, cancelled),
+        None => Err(Missing::NotRunning),
+    };
+    with_wsl(
+        found,
+        Some(deadline.saturating_sub(started.elapsed())),
+        cancelled,
+    )
+}
+
+/// The Windows result, or a WSL service when Labs › OpenCode in WSL is on
+/// and no Windows registration confirmed one. A confirmed service wins; with
+/// neither, "update OpenCode" is the more useful answer.
+fn with_wsl(
+    found: Result<Service, Missing>,
+    budget: Option<Duration>,
+    cancelled: &AtomicBool,
+) -> Result<Service, Missing> {
+    #[cfg(target_os = "windows")]
+    if crate::labs::opencode_in_wsl() {
+        if found.is_err() {
+            return prefer_wsl(found, wsl::discover(budget, cancelled));
+        }
+    } else {
+        wsl::clear_cache();
+    }
+    let _ = (budget, cancelled);
+    found
+}
+
+/// Whether `found` or the WSL search names the service to use: a confirmed
+/// service wins, and with neither, "update OpenCode" is more useful than
+/// "isn't running".
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn prefer_wsl(
+    found: Result<Service, Missing>,
+    wsl: Result<Service, Missing>,
+) -> Result<Service, Missing> {
+    match (found, wsl) {
+        (Ok(service), _) | (_, Ok(service)) => Ok(service),
+        (Err(Missing::Outdated), _) | (_, Err(Missing::Outdated)) => Err(Missing::Outdated),
+        (Err(Missing::NotRunning), Err(Missing::NotRunning)) => Err(Missing::NotRunning),
+    }
 }
 
 /// Whether a service answers now; a short loopback check for availability.
@@ -75,13 +145,36 @@ fn state_dir() -> Option<PathBuf> {
     let root = std::env::var_os("XDG_STATE_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))?;
+        .or_else(|| crate::app_paths::home_dir().map(|home| home.join(".local").join("state")))?;
     Some(root.join("opencode"))
 }
 
 /// `service.json` (the stable, beta and dev channels) first, then other
 /// channels' `service-<channel>.json`; the first that answers wins.
 fn find_in(state: &Path) -> Result<Service, Missing> {
+    discover(state, None, &AtomicBool::new(false), None)
+}
+
+/// [`find_in`] bounded by the caller's remaining time: `Some` stops the whole
+/// search once it is spent, so a stalled service can't outlive the rewrite.
+fn find_in_cancellable(
+    state: &Path,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+) -> Result<Service, Missing> {
+    discover(state, Some(deadline), cancelled, None)
+}
+
+/// `budget` is the caller's whole remaining time, or `None` for one
+/// [`INFO_DEADLINE`] per registration (the Settings and availability paths).
+/// `wsl` marks every confirmed service as one whose files live in WSL.
+fn discover(
+    state: &Path,
+    budget: Option<Duration>,
+    cancelled: &AtomicBool,
+    wsl: Option<&WslHome>,
+) -> Result<Service, Missing> {
+    let started = Instant::now();
     let mut others: Vec<PathBuf> = fs::read_dir(state)
         .map_err(|_| Missing::NotRunning)?
         .flatten()
@@ -100,7 +193,20 @@ fn find_in(state: &Path) -> Result<Service, Missing> {
         .take(MAX_REGISTRATIONS)
         .filter_map(|path| read_registration(&path))
     {
-        match confirm(&registration) {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Missing::NotRunning);
+        }
+        let deadline = match budget {
+            Some(budget) => {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(Missing::NotRunning);
+                }
+                remaining.min(INFO_DEADLINE)
+            }
+            None => INFO_DEADLINE,
+        };
+        match confirm(&registration, deadline, cancelled, wsl) {
             Ok(service) => return Ok(service),
             Err(Missing::Outdated) => missing = Missing::Outdated,
             Err(Missing::NotRunning) => {}
@@ -157,13 +263,19 @@ fn open_private(path: &Path) -> Option<fs::File> {
 
 /// The service a registration names, when it is on loopback and the process
 /// answering `/api/info` is the registered one.
-fn confirm(registration: &Registration) -> Result<Service, Missing> {
+fn confirm(
+    registration: &Registration,
+    deadline: Duration,
+    cancelled: &AtomicBool,
+    wsl: Option<&WslHome>,
+) -> Result<Service, Missing> {
     let service = Service {
         address: loopback_address(&registration.url).ok_or(Missing::NotRunning)?,
         password: registration
             .password
             .clone()
             .filter(|password| !password.is_empty()),
+        wsl: wsl.cloned(),
     };
     #[derive(Deserialize)]
     struct Info {
@@ -171,14 +283,7 @@ fn confirm(registration: &Registration) -> Result<Service, Missing> {
         version: String,
     }
     let response = service
-        .request(
-            "GET",
-            "/api/info",
-            None,
-            None,
-            INFO_DEADLINE,
-            &AtomicBool::new(false),
-        )
+        .request("GET", "/api/info", None, None, deadline, cancelled)
         .map_err(|_| Missing::NotRunning)?;
     if response.status == 404 {
         tracing::warn!(
@@ -226,10 +331,58 @@ fn loopback_address(url: &str) -> Option<SocketAddr> {
 }
 
 impl Service {
+    /// Whether this service's registration and files live in the default WSL
+    /// distribution.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn is_wsl(&self) -> bool {
+        self.wsl.is_some()
+    }
+
+    /// `host` as this service's WSL server sees it, or `None` for a Windows
+    /// service and for a path the distribution can't reach.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) fn wsl_directory(&self, host: &Path) -> Option<String> {
+        self.wsl.as_ref()?.directory(host)
+    }
+
+    /// Hex's OpenCode workspace as this service sees it: a Linux path inside
+    /// WSL, else the host path.
+    fn workspace(&self, directory: &Path) -> Result<String> {
+        match &self.wsl {
+            Some(wsl) => wsl.workspace(),
+            None => host_workspace(directory),
+        }
+    }
+
     /// One request. `directory` scopes it to an OpenCode workspace (created
     /// when first used). HTTP error statuses return normally; transport
-    /// failures, cancellation and the deadline are errors.
+    /// failures, cancellation and the deadline are errors. A scoped request
+    /// to a WSL service that fails makes the next one create the workspace
+    /// again.
     pub(crate) fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        directory: Option<&Path>,
+        deadline: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<Response> {
+        let scoped = directory.is_some();
+        let result = self.request_inner(method, path, body, directory, deadline, cancelled);
+        if scoped
+            && let Some(wsl) = &self.wsl
+            && match &result {
+                Ok(response) => response.status == 404,
+                Err(_) => true,
+            }
+        {
+            wsl.forget_workspace();
+        }
+        result
+    }
+
+    fn request_inner(
         &self,
         method: &str,
         path: &str,
@@ -269,7 +422,7 @@ impl Service {
         if let Some(directory) = directory {
             head.push_str(&format!(
                 "x-opencode-directory: {}\r\n",
-                encode_uri_component(&workspace(directory)?)
+                encode_uri_component(&self.workspace(directory)?)
             ));
         }
         if let Some(body) = body {
@@ -284,19 +437,63 @@ impl Service {
         let mut stream =
             TcpStream::connect_timeout(&self.address, remaining().min(CONNECT_DEADLINE))
                 .map_err(|_| eyre!(NOT_RUNNING))?;
-        stream.set_write_timeout(Some(remaining().max(Duration::from_millis(1))))?;
-        stream
-            .write_all(head.as_bytes())
-            .and_then(|()| stream.write_all(body.unwrap_or_default()))
-            .wrap_err_with(|| format!("could not send OpenCode {path}"))?;
+        // Non-blocking, so a service that stops reading or answering can't hold
+        // the request past cancellation or the deadline. Returning drops the
+        // stream, which closes the socket and discards anything unsent.
+        stream.set_nonblocking(true)?;
+        let mut step = |interest: Interest,
+                        op: &mut dyn FnMut(&mut TcpStream) -> io::Result<usize>|
+         -> Result<io::Result<usize>> {
+            loop {
+                let left = remaining();
+                check(left)?;
+                match op(&mut stream) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if wait(&stream, interest, left.min(WAIT_SLICE))
+                            .wrap_err_with(|| format!("could not reach OpenCode {path}"))?
+                        {
+                            return Ok(Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "OpenCode stopped reading the request",
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    result => return Ok(result),
+                }
+            }
+        };
+        // Why the request stopped short, when OpenCode answered or hung up
+        // before reading all of it. An early answer (a 404 or 413, say) still
+        // returns normally.
+        let mut unsent = None;
+        'send: for mut pending in [head.as_bytes(), body.unwrap_or_default()] {
+            while !pending.is_empty() {
+                let chunk = &pending[..pending.len().min(WRITE_CHUNK)];
+                match step(Interest::Write, &mut |stream| stream.write(chunk))? {
+                    Ok(0) => {
+                        unsent = Some(io::Error::from(io::ErrorKind::WriteZero));
+                        break 'send;
+                    }
+                    Ok(written) => pending = &pending[written..],
+                    Err(error) => {
+                        unsent = Some(error);
+                        break 'send;
+                    }
+                }
+            }
+        }
+        let not_sent = |error: io::Error| -> Result<Response> {
+            Err(error).wrap_err_with(|| format!("could not send OpenCode {path}"))
+        };
         let mut bytes = Vec::new();
         let mut buffer = [0; 64 * 1024];
+        // A service that answers early and closes with the body unread resets
+        // the connection after its answer, so the answer can end in an error
+        // instead of a clean close.
+        let mut closed = true;
         loop {
-            check(remaining())?;
-            stream.set_read_timeout(Some(
-                remaining().clamp(Duration::from_millis(1), READ_SLICE),
-            ))?;
-            match stream.read(&mut buffer) {
+            match step(Interest::Read, &mut |stream| stream.read(&mut buffer))? {
                 Ok(0) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&buffer[..read]);
@@ -304,25 +501,117 @@ impl Service {
                         return Err(eyre!("OpenCode {path} answered more than 16 MiB"));
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) => {}
+                Err(_) if unsent.is_some() => {
+                    closed = false;
+                    break;
+                }
                 Err(error) => {
                     return Err(error).wrap_err_with(|| format!("could not read OpenCode {path}"));
                 }
             }
         }
-        parse_response(bytes).ok_or_else(|| eyre!("OpenCode {path} returned invalid HTTP"))
+        match (parse_response(bytes, closed), unsent) {
+            (Some(response), _) => Ok(response),
+            (None, Some(unsent)) => not_sent(unsent),
+            (None, None) => Err(eyre!("OpenCode {path} returned invalid HTTP")),
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum Interest {
+    Read,
+    Write,
+}
+
+/// Waits up to `timeout` for the socket to become ready. It may return early
+/// or spuriously; the caller retries the operation and rechecks cancellation
+/// and the deadline. While writing it also watches for an answer or a hangup:
+/// `true` means the peer can't take more of the request, so writing stops
+/// instead of spinning on a socket that will never become writable.
+#[cfg(unix)]
+fn wait(stream: &TcpStream, interest: Interest, timeout: Duration) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: match interest {
+            Interest::Read => libc::POLLIN,
+            Interest::Write => libc::POLLOUT | libc::POLLIN,
+        },
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for a socket this call borrows.
+    if unsafe { libc::poll(&mut fd, 1, poll_millis(timeout)) } < 0 {
+        let error = io::Error::last_os_error();
+        return match error.kind() {
+            io::ErrorKind::Interrupted => Ok(false),
+            _ => Err(error),
+        };
+    }
+    readiness(
+        interest,
+        fd.revents,
+        [
+            libc::POLLOUT,
+            libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            libc::POLLNVAL,
+        ],
+    )
+}
+
+#[cfg(windows)]
+fn wait(stream: &TcpStream, interest: Interest, timeout: Duration) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLERR, POLLHUP, POLLNVAL, POLLRDNORM, POLLWRNORM, SOCKET_ERROR, WSAGetLastError,
+        WSAPOLLFD, WSAPoll,
+    };
+    let mut fd = WSAPOLLFD {
+        fd: stream.as_raw_socket() as usize,
+        events: match interest {
+            Interest::Read => POLLRDNORM,
+            Interest::Write => POLLWRNORM | POLLRDNORM,
+        },
+        revents: 0,
+    };
+    // SAFETY: one valid WSAPOLLFD for a socket this call borrows.
+    if unsafe { WSAPoll(&mut fd, 1, poll_millis(timeout)) } == SOCKET_ERROR {
+        let error = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+        return match error.kind() {
+            io::ErrorKind::Interrupted => Ok(false),
+            _ => Err(error),
+        };
+    }
+    readiness(
+        interest,
+        fd.revents,
+        [POLLWRNORM, POLLRDNORM | POLLHUP | POLLERR, POLLNVAL],
+    )
+}
+
+/// `[writable, answered or hung up, invalid]` are the platform's poll flags.
+fn readiness(
+    interest: Interest,
+    revents: i16,
+    [writable, stopped, invalid]: [i16; 3],
+) -> io::Result<bool> {
+    if revents & invalid != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the socket is no longer open",
+        ));
+    }
+    Ok(matches!(interest, Interest::Write) && revents & writable == 0 && revents & stopped != 0)
+}
+
+/// At least one millisecond, so a short remainder still waits instead of spinning.
+fn poll_millis(timeout: Duration) -> i32 {
+    timeout.as_millis().clamp(1, i32::MAX as u128) as i32
 }
 
 /// Creates Hex's OpenCode workspace on first use and returns the path
 /// OpenCode should see.
-fn workspace(directory: &Path) -> Result<String> {
+fn host_workspace(directory: &Path) -> Result<String> {
     fs::create_dir_all(directory).wrap_err_with(|| {
         format!(
             "could not create OpenCode workspace {}",
@@ -345,7 +634,10 @@ fn workspace(directory: &Path) -> Result<String> {
         .to_owned())
 }
 
-fn parse_response(bytes: Vec<u8>) -> Option<Response> {
+/// `closed` says the service closed cleanly, so a body without a length or
+/// chunked framing ends there; otherwise such a body may be cut short and is
+/// refused.
+fn parse_response(bytes: Vec<u8>, closed: bool) -> Option<Response> {
     let split = bytes.windows(4).position(|window| window == b"\r\n\r\n")?;
     let head = std::str::from_utf8(&bytes[..split]).ok()?;
     let mut lines = head.split("\r\n");
@@ -366,8 +658,10 @@ fn parse_response(bytes: Vec<u8>) -> Option<Response> {
         dechunk(body)?
     } else if let Some(length) = length {
         body.get(..length)?.to_vec()
-    } else {
+    } else if closed {
         body.to_vec()
+    } else {
+        return None;
     };
     Some(Response { status, body })
 }
@@ -487,6 +781,7 @@ pub(crate) mod tests {
         Service {
             address: loopback_address(url).unwrap(),
             password: Some("fixture-password".into()),
+            wsl: None,
         }
     }
 
@@ -546,6 +841,51 @@ pub(crate) mod tests {
         drop(closed);
         register(&state, "service.json", &url, 42);
         assert_eq!(find_in(&state), Err(Missing::NotRunning));
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn a_service_search_is_bounded_by_the_callers_deadline() {
+        let state = state_root("search-deadline");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        register(&state, "service.json", &url, 42);
+        let started = Instant::now();
+        assert_eq!(
+            find_in_cancellable(&state, Duration::from_millis(100), &AtomicBool::new(false)),
+            Err(Missing::NotRunning)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
+    fn a_service_search_stops_when_the_caller_cancels() {
+        let state = state_root("search-cancel");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        register(&state, "service.json", &url, 42);
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::Release);
+            });
+            assert_eq!(
+                find_in_cancellable(&state, Duration::from_secs(30), &cancelled),
+                Err(Missing::NotRunning)
+            );
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
         fs::remove_dir_all(state).unwrap();
     }
 
@@ -634,7 +974,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         // The drive form on Windows, without canonicalize's verbatim prefix.
-        let workspace = workspace(&root).unwrap();
+        let workspace = host_workspace(&root).unwrap();
         assert!(!workspace.starts_with(r"\\?\"));
         let headers = server.join().unwrap();
         assert!(headers.contains(&format!(
@@ -644,6 +984,166 @@ pub(crate) mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"hello world");
         fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_wsl_service_maps_a_capture_folder_into_its_distribution() {
+        let root = state_root("wsl-directory");
+        let service = Service {
+            wsl: Some(WslHome::for_test(root.join("home"), "/home/dax")),
+            ..fixture("http://127.0.0.1:1/")
+        };
+        assert!(service.is_wsl());
+        assert_eq!(
+            service.wsl_directory(Path::new(r"C:\Users\dax\captures\a.scrawl")),
+            Some("/mnt/c/Users/dax/captures/a.scrawl".into())
+        );
+        assert_eq!(service.wsl_directory(Path::new(r"\\server\share\a")), None);
+        let windows = fixture("http://127.0.0.1:1/");
+        assert!(!windows.is_wsl());
+        assert_eq!(windows.wsl_directory(Path::new(r"C:\a")), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_wsl_service_gets_the_workspace_its_linux_server_can_use() {
+        let root = state_root("wsl-workspace");
+        let (url, server) = serve(vec![("GET /api/model".into(), 200, "{}".into())]);
+        let service = Service {
+            wsl: Some(WslHome::for_test(root.join("home"), "/home/dax")),
+            ..fixture(&url)
+        };
+        let windows = root.join("windows");
+        let response = service
+            .request(
+                "GET",
+                "/api/model",
+                None,
+                Some(&windows),
+                Duration::from_secs(5),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let (headers, _) = server.join().unwrap().remove(0);
+        let linux = "/home/dax/.local/share/hex/opencode";
+        assert!(headers.contains(&format!(
+            "x-opencode-directory: {}\r\n",
+            encode_uri_component(linux)
+        )));
+        assert!(root.join("home/.local/share/hex/opencode").is_dir());
+        assert!(!windows.exists(), "the Windows workspace stays untouched");
+        assert_eq!(response.status, 200);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_wsl_request_forgets_the_workspace() {
+        let root = state_root("wsl-retry-error");
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
+        let service = Service {
+            wsl: Some(WslHome::for_test(root.join("home"), "/home/dax")),
+            ..fixture(&url)
+        };
+        let windows = root.join("windows");
+        let request = || {
+            service.request(
+                "GET",
+                "/api/model",
+                None,
+                Some(&windows),
+                Duration::from_millis(500),
+                &AtomicBool::new(false),
+            )
+        };
+        assert!(request().is_err());
+        let workspace = root.join("home/.local/share/hex/opencode");
+        assert!(workspace.is_dir());
+        fs::remove_dir_all(&workspace).unwrap();
+        assert!(request().is_err());
+        assert!(
+            workspace.is_dir(),
+            "a failed request creates the workspace again"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_not_found_wsl_request_forgets_the_workspace() {
+        let root = state_root("wsl-retry-404");
+        let (url, server) = serve(vec![
+            ("GET /api/model".into(), 404, "{}".into()),
+            ("GET /api/model".into(), 404, "{}".into()),
+        ]);
+        let service = Service {
+            wsl: Some(WslHome::for_test(root.join("home"), "/home/dax")),
+            ..fixture(&url)
+        };
+        let windows = root.join("windows");
+        let request = || {
+            service
+                .request(
+                    "GET",
+                    "/api/model",
+                    None,
+                    Some(&windows),
+                    Duration::from_secs(5),
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+                .status
+        };
+        assert_eq!(request(), 404);
+        let workspace = root.join("home/.local/share/hex/opencode");
+        assert!(workspace.is_dir());
+        fs::remove_dir_all(&workspace).unwrap();
+        assert_eq!(request(), 404);
+        assert!(workspace.is_dir(), "a 404 creates the workspace again");
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_wsl_service_is_a_fallback_only_without_a_windows_one() {
+        let service = fixture("http://127.0.0.1:1/");
+        let wsl = || Service {
+            wsl: Some(WslHome::for_test(
+                PathBuf::from(r"\\wsl.localhost\Ubuntu\home\dax"),
+                "/home/dax",
+            )),
+            ..service.clone()
+        };
+        assert_ne!(wsl(), service, "a WSL service is not the Windows one");
+        assert_eq!(
+            prefer_wsl(Ok(service.clone()), Ok(wsl())),
+            Ok(service.clone()),
+            "a Windows service wins"
+        );
+        assert_eq!(
+            prefer_wsl(Err(Missing::NotRunning), Ok(wsl())),
+            Ok(wsl()),
+            "with no Windows service, the WSL one is used"
+        );
+        assert_eq!(
+            prefer_wsl(Err(Missing::Outdated), Ok(wsl())),
+            Ok(wsl()),
+            "a working WSL service is used over a Windows update notice"
+        );
+        assert_eq!(
+            prefer_wsl(Err(Missing::Outdated), Err(Missing::NotRunning)),
+            Err(Missing::Outdated),
+            "a Windows service that needs an update is still reported"
+        );
+        assert_eq!(
+            prefer_wsl(Err(Missing::NotRunning), Err(Missing::Outdated)),
+            Err(Missing::Outdated),
+            "a WSL service that needs an update is reported too"
+        );
+        assert_eq!(
+            prefer_wsl(Err(Missing::NotRunning), Err(Missing::NotRunning)),
+            Err(Missing::NotRunning)
+        );
     }
 
     #[test]
@@ -683,5 +1183,157 @@ pub(crate) mod tests {
         });
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(listener);
+    }
+
+    /// Far more than loopback socket buffers hold, so sending it stalls when
+    /// the service stops reading. A prime period, so a skipped or repeated
+    /// chunk can't line up with the data.
+    fn large_body() -> Vec<u8> {
+        (0..64 * 1024 * 1024)
+            .map(|index: u32| (index % 251) as u8)
+            .collect()
+    }
+
+    /// Accepts connections and holds them, never reading, until `released`
+    /// fires or its sender drops.
+    fn hold(
+        listener: TcpListener,
+        released: std::sync::mpsc::Receiver<()>,
+    ) -> thread::JoinHandle<()> {
+        listener.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let mut streams = Vec::new();
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                released.recv_timeout(Duration::from_millis(10))
+            {
+                if let Ok((stream, _)) = listener.accept() {
+                    streams.push(stream);
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_service_that_stops_reading_is_bounded_by_cancellation_and_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let service = fixture(&url);
+        let body = large_body();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let held = hold(listener, released);
+        let started = Instant::now();
+        let error = service
+            .request(
+                "POST",
+                "/generate",
+                Some(&body),
+                None,
+                Duration::from_millis(300),
+                &AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(100));
+                cancelled.store(true, Ordering::Release);
+            });
+            let started = Instant::now();
+            let error = service
+                .request(
+                    "POST",
+                    "/generate",
+                    Some(&body),
+                    None,
+                    Duration::from_secs(30),
+                    &cancelled,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("cancelled"), "{error}");
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                started.elapsed()
+            );
+        });
+        release.send(()).unwrap();
+        held.join().unwrap();
+    }
+
+    #[test]
+    fn an_answer_before_the_whole_body_is_sent_still_returns() {
+        answered_early(true);
+        // Closing with the body unread resets the connection. Windows drops
+        // data already received when a reset arrives, so this case is Linux's.
+        #[cfg(target_os = "linux")]
+        answered_early(false);
+    }
+
+    /// The service answers 404 after the request line, then either half-closes
+    /// and keeps the socket open, or closes it with the body unread.
+    fn answered_early(half_close: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&mut stream).read_line(&mut line).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngone",
+                )
+                .unwrap();
+            if half_close {
+                stream.shutdown(std::net::Shutdown::Write).unwrap();
+                let _ = released.recv_timeout(Duration::from_secs(10));
+            }
+        });
+        let started = Instant::now();
+        let response = fixture(&url)
+            .request(
+                "POST",
+                "/generate",
+                Some(&large_body()),
+                None,
+                Duration::from_secs(30),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"gone");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = release.send(());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_large_body_arrives_intact() {
+        let body = large_body();
+        let (url, server) = serve(vec![("POST /generate".into(), 200, "{}".into())]);
+        let response = fixture(&url)
+            .request(
+                "POST",
+                "/generate",
+                Some(&body),
+                None,
+                Duration::from_secs(30),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"{}");
+        let (_, received) = server.join().unwrap().remove(0);
+        assert!(received == body, "the body changed in transit");
     }
 }

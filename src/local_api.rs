@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -16,17 +16,31 @@ use crate::desktop::events::{EventLog, VoiceEvent, now_ms};
 mod dictation;
 mod discovery;
 mod http;
+mod meeting_events;
+pub(crate) mod processing;
 mod streams;
+pub(crate) mod timestamps;
+mod transcriptions;
 
 #[cfg(debug_assertions)]
 #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 pub use discovery::call_developer;
 use discovery::*;
 pub use discovery::{call_control, running_pid};
+pub(crate) use discovery::{error_code, post_wav};
 use http::*;
+pub use processing::Processing;
+pub use timestamps::Timestamps;
+use transcriptions::transcribe_audio;
 const API_VERSION: &str = "2";
 const LIVE_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
-const ACCEPT_INTERVAL: Duration = Duration::from_millis(10);
+/// The longest the accept loop sleeps without a connection. Shutdown wakes
+/// it at once ([`wake_acceptor`]); this only bounds a shutdown whose wake
+/// could not connect.
+const ACCEPT_WAIT: Duration = Duration::from_secs(1);
+/// The pause after an accept error before the next try.
+const ACCEPT_RETRY: Duration = Duration::from_millis(10);
+const WAKE_TIMEOUT: Duration = Duration::from_millis(250);
 const CONNECTION_TIMEOUT: Duration = Duration::from_millis(500);
 const HEADER_DEADLINE: Duration = Duration::from_secs(2);
 const UPLOAD_DEADLINE: Duration = Duration::from_secs(30);
@@ -37,7 +51,7 @@ const CONNECTION_QUEUE_CAPACITY: usize = 16;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
 const MAX_PATH_BYTES: usize = 2 * 1024;
-const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_AUDIO_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DEVELOPER_CONTROL_BYTES: usize = 16 * 1024;
 const DEVELOPER_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
@@ -87,6 +101,9 @@ struct HttpContext {
     dictations: dictation::Dictations,
     streams: Arc<crate::transcription::stream::Streams>,
     stream_engine: crate::transcription::stream::EngineSource,
+    meeting_events: meeting_events::Source,
+    processing: processing::Processing,
+    timestamps: timestamps::Timestamps,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -102,8 +119,13 @@ struct CapabilitiesResponse {
     audio_formats: [&'static str; 1],
     partial_transcripts: bool,
     service_capture: bool,
+    /// `/dictations/{id}/partials` for a start with `"partials": true`.
+    dictation_partials: bool,
     /// `/streams` (`docs/streams.md`).
     streams: bool,
+    /// `process=global` on `/transcriptions` and `/streams/{id}/finish`
+    /// (Labs › Process API transcripts).
+    output_processing: bool,
     developer_control: bool,
     control: bool,
 }
@@ -115,8 +137,16 @@ pub struct LocalApiOptions {
     /// The `hex` control commands (`POST /control`).
     pub control: Option<SyncSender<crate::control::ControlCall>>,
     /// Running-app dictation (`/dictations`): the macOS recognition loop or
-    /// the Linux listener.
+    /// the Linux or Windows listener.
     pub dictation_control: Option<dictation::Control>,
+    /// The running app's Global-mode output processor for `process=global`.
+    /// Uninstalled, `/transcriptions` and `/streams/{id}/finish` answer
+    /// `409 processing-unavailable` when asked to process.
+    pub processing: Processing,
+    /// Native timings on `/transcriptions` (Labs › Timestamps in API
+    /// transcripts). Off, a timed request answers
+    /// `403 timestamps-disabled`.
+    pub timestamps: Timestamps,
     /// Where `/streams` finds its engine; the running app's shared engine
     /// when unset.
     pub(crate) stream_engine: Option<crate::transcription::stream::EngineSource>,
@@ -142,6 +172,7 @@ impl LocalApi {
         event_path: &Path,
         control: SyncSender<crate::control::ControlCall>,
         dictation_control: Option<dictation::Control>,
+        processing: Option<Processing>,
     ) -> Option<Self> {
         let started = EventLog::create(event_path)
             .map_err(Into::into)
@@ -151,6 +182,7 @@ impl LocalApi {
                     LocalApiOptions {
                         control: Some(control),
                         dictation_control,
+                        processing: processing.unwrap_or_default(),
                         ..Default::default()
                     },
                 )
@@ -179,6 +211,25 @@ impl LocalApi {
         events: EventLog,
         options: LocalApiOptions,
         instance: Option<crate::desktop::instance::InstanceLock>,
+    ) -> Result<Self> {
+        Self::start_with_meeting_events(
+            discovery_path,
+            health,
+            events,
+            options,
+            instance,
+            meeting_events::Source::default(),
+        )
+    }
+
+    /// [`Self::start_bound`] with `/meetings/events` on `meeting_events`.
+    fn start_with_meeting_events(
+        discovery_path: Option<PathBuf>,
+        health: HealthProvider,
+        events: EventLog,
+        options: LocalApiOptions,
+        instance: Option<crate::desktop::instance::InstanceLock>,
+        meeting_events: meeting_events::Source,
     ) -> Result<Self> {
         if let Some(path) = &discovery_path {
             prepare_discovery_path(path)?;
@@ -228,6 +279,9 @@ impl LocalApi {
             stream_engine: options
                 .stream_engine
                 .unwrap_or_else(|| Arc::new(crate::transcription::stream::shared_engine)),
+            meeting_events,
+            processing: options.processing,
+            timestamps: options.timestamps,
         };
         let (ready, readiness) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -247,6 +301,7 @@ impl LocalApi {
             Ok(true) => {}
             Ok(false) | Err(_) => {
                 shutdown.store(true, Ordering::Release);
+                wake_acceptor(document.port);
                 let _ = worker.join();
                 bail!("local API HTTP workers could not start");
             }
@@ -290,6 +345,7 @@ impl LocalApi {
             discovery.remove_if_owned();
         }
         self.shutdown.store(true, Ordering::Release);
+        wake_acceptor(self.document.port);
         if worker.join().is_err() {
             tracing::error!("local API thread panicked during shutdown");
         }
@@ -415,6 +471,8 @@ fn serve(listener: TcpListener, context: HttpContext, ready: mpsc::SyncSender<bo
 
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
+            // The connection that woke a shutdown is not a request.
+            Ok(_) if shutdown.load(Ordering::Acquire) => break,
             Ok((stream, _)) => match connections.try_send(stream) {
                 Ok(()) => {}
                 Err(TrySendError::Full(mut stream)) => {
@@ -422,29 +480,16 @@ fn serve(listener: TcpListener, context: HttpContext, ready: mpsc::SyncSender<bo
                 }
                 Err(TrySendError::Disconnected(_)) => break,
             },
+            // Waking on the next connection (or shutdown's wake) instead of
+            // polling took a loopback request from 12.5 ms to 0.12 ms, and
+            // an idle Hex from 100 wakeups a second to one.
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                #[cfg(unix)]
-                {
-                    use std::os::fd::AsRawFd;
-                    let mut pfd = libc::pollfd {
-                        fd: listener.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // Waking on the next connection instead of sleeping took
-                    // a loopback request from 12.5 ms to 0.12 ms.
-                    // SAFETY: `pfd` is one valid pollfd for the listener's fd.
-                    unsafe {
-                        libc::poll(&raw mut pfd, 1, ACCEPT_INTERVAL.as_millis() as libc::c_int);
-                    }
-                }
-                #[cfg(not(unix))]
-                thread::sleep(ACCEPT_INTERVAL);
+                wait_for_connection(&listener, ACCEPT_WAIT);
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
                 tracing::error!(%error, "local API accept failed");
-                thread::sleep(ACCEPT_INTERVAL);
+                thread::sleep(ACCEPT_RETRY);
             }
         }
     }
@@ -454,6 +499,46 @@ fn serve(listener: TcpListener, context: HttpContext, ready: mpsc::SyncSender<bo
             tracing::error!("local API HTTP worker panicked during shutdown");
         }
     }
+}
+
+/// Sleeps until `listener` has a connection to accept, or `limit` passes.
+fn wait_for_connection(listener: &TcpListener, limit: Duration) {
+    let timeout = limit.as_millis() as i32;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is one valid pollfd for the listener's fd.
+        unsafe {
+            libc::poll(&raw mut pfd, 1, timeout);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
+        let mut pfd = WSAPOLLFD {
+            fd: listener.as_raw_socket() as usize,
+            events: POLLRDNORM,
+            revents: 0,
+        };
+        // SAFETY: `pfd` is one valid entry for the listener's socket.
+        unsafe {
+            WSAPoll(&raw mut pfd, 1, timeout);
+        }
+    }
+}
+
+/// Ends the accept loop's wait: a connection to the listener wakes it, and
+/// it sees the shutdown flag set before. A wake that cannot connect leaves
+/// the loop to notice within [`ACCEPT_WAIT`].
+fn wake_acceptor(port: u16) {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let _ = TcpStream::connect_timeout(&address, WAKE_TIMEOUT);
 }
 
 fn http_worker(pending: Arc<Mutex<Receiver<TcpStream>>>, context: Arc<HttpContext>) {
@@ -506,15 +591,20 @@ fn http_worker(pending: Arc<Mutex<Receiver<TcpStream>>>, context: Arc<HttpContex
                 content_length,
                 body_prefix,
                 admission,
+                processing,
+                timestamps,
             } => {
                 let response = transcribe_audio(
                     &mut stream,
-                    selection,
+                    transcriptions::Admitted {
+                        selection,
+                        admission,
+                        guard: processing,
+                        timings: timestamps,
+                    },
                     content_length,
                     body_prefix,
-                    &context.transcription,
-                    &context.shutdown,
-                    admission,
+                    &context,
                 );
                 if let Some(response) = response
                     && let Err(error) = write_response(&mut stream, response)
@@ -569,6 +659,9 @@ fn http_worker(pending: Arc<Mutex<Receiver<TcpStream>>>, context: Arc<HttpContex
                 dictation::handle(&mut stream, id, owner_token, action, &context);
             }
             RequestAction::Stream(action) => streams::handle(&mut stream, action, &context),
+            RequestAction::MeetingEvents(subscription) => {
+                meeting_events::stream(&mut stream, subscription, &context);
+            }
         }
     }
 }
@@ -582,7 +675,12 @@ fn handle_request(request: HttpRequest, context: &HttpContext) -> RequestAction 
         return RequestAction::Respond(HttpResponse::empty(401));
     }
     if request.method == "POST" && path == "/transcriptions" {
-        return transcription_action(request, &context.transcription);
+        return transcription_action(
+            request,
+            &context.transcription,
+            &context.processing,
+            &context.timestamps,
+        );
     }
     if request.method == "POST" && path == "/dev/control" {
         return developer_control_action(request, context.developer_control.is_some());
@@ -599,6 +697,9 @@ fn handle_request(request: HttpRequest, context: &HttpContext) -> RequestAction 
                 body_prefix,
             },
         );
+    }
+    if path == meeting_events::PATH {
+        return meeting_events::action(&request, context);
     }
     if request.method == "POST" && path == "/streams" {
         return streams::create_action(request);
@@ -618,6 +719,7 @@ fn handle_request(request: HttpRequest, context: &HttpContext) -> RequestAction 
             ("POST", "finish") => Some(DictationAction::Finish),
             ("POST", "cancel") => Some(DictationAction::Cancel),
             ("GET", "levels") => Some(DictationAction::Levels),
+            ("GET", "partials") => Some(DictationAction::Partials),
             ("GET", "audio") => Some(DictationAction::Audio),
             ("POST", "heartbeat") => Some(DictationAction::Heartbeat),
             _ => None,
@@ -640,7 +742,9 @@ fn handle_request(request: HttpRequest, context: &HttpContext) -> RequestAction 
                 audio_formats: ["audio/wav"],
                 partial_transcripts: false,
                 service_capture: context.dictations.available(),
+                dictation_partials: context.dictations.partials_available(),
                 streams: true,
+                output_processing: context.processing.available(),
                 developer_control: context.developer_control.is_some(),
                 control: context.control.is_some(),
             },
@@ -689,7 +793,23 @@ fn handle_request(request: HttpRequest, context: &HttpContext) -> RequestAction 
 fn transcription_action(
     request: HttpRequest,
     transcription: &crate::transcription::service::TranscriptionServiceHandle,
+    processing: &processing::Processing,
+    timestamps: &timestamps::Timestamps,
 ) -> RequestAction {
+    let guard = match processing::wanted(&request.path) {
+        Ok(wanted) => match processing::gate(wanted, processing) {
+            Ok(guard) => guard,
+            Err(response) => return RequestAction::Respond(response),
+        },
+        Err(code) => return RequestAction::Respond(HttpResponse::code(400, code)),
+    };
+    let requested = match timestamps::requested(&request.path) {
+        Ok(requested) => requested,
+        Err(code) => return RequestAction::Respond(HttpResponse::code(400, code)),
+    };
+    if let Err(response) = timestamps::gate(requested, timestamps) {
+        return RequestAction::Respond(response);
+    }
     if !request.has_content_type("audio/wav") {
         return RequestAction::Respond(HttpResponse::code(415, "unsupported-audio"));
     }
@@ -725,6 +845,8 @@ fn transcription_action(
         content_length,
         body_prefix: request.body_prefix,
         admission,
+        processing: guard,
+        timestamps: requested,
     }
 }
 
@@ -934,97 +1056,6 @@ fn selection_query(path: &str) -> std::result::Result<SelectionQuery, &'static s
         }
     }
     Ok(selection)
-}
-
-fn transcribe_audio(
-    stream: &mut TcpStream,
-    selection: crate::transcription::models::TranscriptionSelection,
-    content_length: usize,
-    mut body: Vec<u8>,
-    transcription: &crate::transcription::service::TranscriptionServiceHandle,
-    shutdown: &AtomicBool,
-    admission: crate::transcription::service::AudioAdmission,
-) -> Option<HttpResponse> {
-    if let Err(error) = read_body_bounded(
-        stream,
-        content_length,
-        &mut body,
-        shutdown,
-        MAX_AUDIO_BYTES,
-        UPLOAD_DEADLINE,
-    ) {
-        return Some(match error {
-            BodyReadError::ResourceExhausted => HttpResponse::code(413, "resource-exhausted"),
-            BodyReadError::Invalid => HttpResponse::code(400, "invalid-audio"),
-            BodyReadError::Io(error) => {
-                tracing::debug!(%error, "audio upload stopped before completion");
-                HttpResponse::code(400, "invalid-audio")
-            }
-            BodyReadError::Deadline => HttpResponse::code(408, "upload-timeout"),
-            BodyReadError::Shutdown => return None,
-        });
-    }
-    let clip = match crate::transcription::service::AudioClip::decode_wav(Cursor::new(body)) {
-        Ok(clip) => clip,
-        Err(crate::transcription::service::AudioError::ResourceExhausted) => {
-            return Some(HttpResponse::code(413, "resource-exhausted"));
-        }
-        Err(crate::transcription::service::AudioError::Unsupported) => {
-            return Some(HttpResponse::code(415, "unsupported-audio"));
-        }
-        Err(crate::transcription::service::AudioError::Invalid) => {
-            return Some(HttpResponse::code(400, "invalid-audio"));
-        }
-    };
-    let duration_ms = clip.duration_ms;
-    let job = match transcription.transcribe(selection, clip, admission) {
-        Ok(job) => job,
-        Err(error) => return Some(transcription_error(error)),
-    };
-    loop {
-        match job.wait_timeout(TRANSCRIPTION_POLL_INTERVAL) {
-            Ok(Some(Ok(transcript))) => {
-                return Some(HttpResponse::json(
-                    200,
-                    &serde_json::json!({
-                        "transcript": transcript,
-                        "durationMs": duration_ms,
-                    }),
-                ));
-            }
-            Ok(Some(Err(error))) | Err(error) => return Some(transcription_error(error)),
-            Ok(None) => {
-                if shutdown.load(Ordering::Acquire) || client_aborted(stream) {
-                    job.cancel();
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-fn transcription_error(
-    error: crate::transcription::service::TranscriptionServiceError,
-) -> HttpResponse {
-    match error {
-        crate::transcription::service::TranscriptionServiceError::QueueFull => {
-            HttpResponse::code(429, "queue-full")
-        }
-        crate::transcription::service::TranscriptionServiceError::Unavailable => {
-            HttpResponse::code(503, "service-gone")
-        }
-        crate::transcription::service::TranscriptionServiceError::Cancelled => {
-            HttpResponse::code(409, "cancelled")
-        }
-        crate::transcription::service::TranscriptionServiceError::Model(error) => {
-            tracing::error!(%error, "prepared transcription model could not load");
-            HttpResponse::code(500, "model-load-failed")
-        }
-        crate::transcription::service::TranscriptionServiceError::Inference(error) => {
-            tracing::error!(%error, "local transcription failed");
-            HttpResponse::code(500, "transcription-failed")
-        }
-    }
 }
 
 fn client_aborted(stream: &TcpStream) -> bool {
@@ -1301,6 +1332,10 @@ enum RequestAction {
         content_length: usize,
         body_prefix: Vec<u8>,
         admission: crate::transcription::service::AudioAdmission,
+        /// `process=global` was asked for; the guard holds its one slot.
+        processing: Option<processing::Guard>,
+        /// `timestamps=segment|word` was asked for, and the lab allows it.
+        timestamps: crate::transcription::transcript::TimestampLevel,
     },
     DeveloperControl {
         content_length: usize,
@@ -1320,6 +1355,7 @@ enum RequestAction {
         action: DictationAction,
     },
     Stream(streams::StreamAction),
+    MeetingEvents(crate::meeting::finished_events::Subscription),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1327,6 +1363,7 @@ enum DictationAction {
     Finish,
     Cancel,
     Levels,
+    Partials,
     Audio,
     Heartbeat,
 }
@@ -1408,6 +1445,7 @@ mod tests {
         assert_eq!(capabilities["serviceCapture"], false);
         assert_eq!(capabilities["developerControl"], false);
         assert_eq!(capabilities["control"], false);
+        assert_eq!(capabilities["outputProcessing"], false);
         assert_eq!(capabilities["audioFormats"][0], "audio/wav");
         let vitals = request(document.port, Some(&document.token), "/profile/vitals");
         #[cfg(target_os = "macos")]
@@ -1647,6 +1685,7 @@ mod tests {
                 owner_token,
                 levels,
                 reply,
+                ..
             } = next_dictation_control(&controls)
             else {
                 panic!("expected dictation start")
@@ -2041,6 +2080,8 @@ mod tests {
                 body_prefix: Vec::new(),
             },
             &transcription,
+            &Processing::default(),
+            &Timestamps::default(),
         );
         let RequestAction::Respond(response) = action else {
             panic!("unsupported audio must be rejected before upload");
@@ -2059,6 +2100,8 @@ mod tests {
                 body_prefix: Vec::new(),
             },
             &transcription,
+            &Processing::default(),
+            &Timestamps::default(),
         );
         let RequestAction::Respond(response) = action else {
             panic!("unsafe body size must be rejected before upload");
@@ -2087,6 +2130,9 @@ mod tests {
             dictations: dictation::Dictations::new(None),
             streams: Arc::default(),
             stream_engine: Arc::new(crate::transcription::stream::shared_engine),
+            meeting_events: meeting_events::Source::default(),
+            processing: Processing::default(),
+            timestamps: Timestamps::default(),
         };
         let action = handle_request(
             HttpRequest {
@@ -2193,6 +2239,29 @@ mod tests {
         let loading = response.find("\"type\":\"loading\"").unwrap();
         let ok = response.find("\"type\":\"ok\"").unwrap();
         assert!(loading < ok);
+    }
+
+    #[test]
+    fn an_idle_api_answers_at_once_and_shutdown_wakes_it() {
+        let directory = temp_directory();
+        let events = EventLog::create(&directory.join("events.ndjson")).unwrap();
+        let mut api = start_unpublished(events, LocalApiOptions::default()).unwrap();
+        // The accept loop is asleep in its long wait by now.
+        thread::sleep(Duration::from_millis(100));
+        let asked = Instant::now();
+        let token = api.document.token.clone();
+        let health = request(api.document.port, Some(&token), "/health");
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        assert!(asked.elapsed() < ACCEPT_WAIT / 2);
+        thread::sleep(Duration::from_millis(100));
+        let stopping = Instant::now();
+        api.shutdown();
+        assert!(
+            stopping.elapsed() < ACCEPT_WAIT / 2,
+            "shutdown took {:?}",
+            stopping.elapsed()
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::artifacts::{
-    COHERE_ARTIFACT, COHERE_LANGUAGES, GIGAAM_V3_E2E_RNNT_ARTIFACT, IVRIT_WHISPER_ARTIFACT,
-    NEMOTRON_3_5_ASR_ARTIFACT, NEMOTRON_3_5_LANGUAGES, NEMOTRON_3_5_LOCALES,
+    COHERE_ARTIFACT, COHERE_LANGUAGES, GIGAAM_V3_E2E_RNNT_ARTIFACT, GRANITE_SPEECH_5_ARTIFACT,
+    GRANITE_SPEECH_5_LANGUAGES, IVRIT_WHISPER_ARTIFACT, NB_WHISPER_MEDIUM_ARTIFACT,
+    NEMOTRON_3_5_ASR_ARTIFACT, NEMOTRON_3_5_LANGUAGES, NEMOTRON_3_5_LOCALES, ORUKEET_ARTIFACT,
     PARAKEET_ULTRA_ARTIFACT, PARAKEET_UNIFIED_ENGLISH_ARTIFACT, PARAKEET_V2_ARTIFACT,
     PARAKEET_V3_ARTIFACT, PARAKEET_V3_LANGUAGES, QWEN_ARTIFACT, QWEN_LANGUAGES, QWENCLEO_ARTIFACT,
     SENSEVOICE_ARTIFACT, UNDERDOG_BARK_3_CLEAN_ARTIFACT, UNDERDOG_BARK_3_PRO_ARTIFACT,
@@ -35,6 +36,7 @@ pub enum TranscriptionModelId {
     ParakeetUnifiedEnglish,
     ParakeetV2,
     ParakeetV3,
+    Orukeet,
     WhisperLargeV3Turbo,
     Qwen3Asr06B,
     QwenCleoAsr17B,
@@ -46,6 +48,8 @@ pub enum TranscriptionModelId {
     ParakeetUltra,
     Nemotron35Asr,
     GigaAmV3,
+    NbWhisperMedium,
+    GraniteSpeech5,
     AppleSpeech,
     Custom(CustomModelId),
 }
@@ -69,6 +73,7 @@ impl TranscriptionModelId {
             Self::ParakeetUnifiedEnglish => "parakeet_unified_en",
             Self::ParakeetV2 => "parakeet_v2",
             Self::ParakeetV3 => "parakeet_v3",
+            Self::Orukeet => "orukeet",
             Self::WhisperLargeV3Turbo => "whisper_large_v3_turbo",
             Self::Qwen3Asr06B => "qwen3_asr06_b",
             Self::QwenCleoAsr17B => "qwencleo_asr_1_7b",
@@ -80,6 +85,8 @@ impl TranscriptionModelId {
             Self::ParakeetUltra => "parakeet_ultra",
             Self::Nemotron35Asr => "nemotron_3_5_asr",
             Self::GigaAmV3 => "gigaam_v3",
+            Self::NbWhisperMedium => "nb_whisper_medium",
+            Self::GraniteSpeech5 => "granite_speech_5",
             Self::AppleSpeech => "apple_speech",
             Self::Custom(id) => id.as_str(),
         }
@@ -105,6 +112,7 @@ impl FromStr for TranscriptionModelId {
             "parakeet_unified_en" => Ok(Self::ParakeetUnifiedEnglish),
             "parakeet_v2" => Ok(Self::ParakeetV2),
             "parakeet_v3" => Ok(Self::ParakeetV3),
+            "orukeet" => Ok(Self::Orukeet),
             "whisper_large_v3_turbo" => Ok(Self::WhisperLargeV3Turbo),
             "qwen3_asr06_b" => Ok(Self::Qwen3Asr06B),
             "qwencleo_asr_1_7b" => Ok(Self::QwenCleoAsr17B),
@@ -116,6 +124,8 @@ impl FromStr for TranscriptionModelId {
             "parakeet_ultra" => Ok(Self::ParakeetUltra),
             "nemotron_3_5_asr" => Ok(Self::Nemotron35Asr),
             "gigaam_v3" => Ok(Self::GigaAmV3),
+            "nb_whisper_medium" => Ok(Self::NbWhisperMedium),
+            "granite_speech_5" => Ok(Self::GraniteSpeech5),
             "apple_speech" => Ok(Self::AppleSpeech),
             _ => CustomModelId::parse(value)
                 .map(Self::Custom)
@@ -278,12 +288,19 @@ impl ModelDefinition {
     }
 
     /// The languages Settings offers for this model, in [`LANGUAGES`] order,
-    /// Auto first when the model detects the language.
+    /// Auto first when the model detects the language, then the other
+    /// languages the model declares (an import's Norwegian, #1148).
     pub fn language_choices(&self) -> Vec<&'static str> {
         LANGUAGES
             .iter()
             .map(|(code, _)| *code)
             .filter(|code| self.supports_language(code))
+            .chain(
+                self.languages
+                    .iter()
+                    .copied()
+                    .filter(|code| *code != "*" && !super::languages::is_listed(code)),
+            )
             .collect()
     }
 
@@ -339,6 +356,20 @@ impl ModelDefinition {
                 VocabularyUse::Prompt
             }
             _ => VocabularyUse::None,
+        }
+    }
+
+    /// How many of `entries`, first in list order, this model's
+    /// transcription reads (`dictation::vocabulary::terms_read`).
+    pub fn vocabulary_terms_read(
+        &self,
+        entries: &[crate::dictation::vocabulary::VocabularyEntry],
+    ) -> usize {
+        match self.runtime {
+            ModelRuntime::Gguf(artifact) => {
+                crate::dictation::vocabulary::terms_read(entries, artifact.architecture)
+            }
+            _ => 0,
         }
     }
 
@@ -400,9 +431,28 @@ pub const MODELS: &[ModelDefinition] = &[
         streams: false,
         runtime: ModelRuntime::Gguf(&PARAKEET_V3_ARTIFACT),
         languages: PARAKEET_V3_LANGUAGES,
-        // The pinned v3 artifact detects language from audio and has no prompt input.
+        // The pinned v3 artifact detects the language from audio and has no
+        // prompt input, so it is offered under Auto.
         accepts_language_hint: false,
-        supports_language_detection: false,
+        supports_language_detection: true,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::Orukeet,
+        name: "Orukeet",
+        // The card says it runs as fast as Parakeet v3, and transcribe.cpp's
+        // catalog puts its Q8_0 file beside v3's on the same machines, so it
+        // keeps v3's figure.
+        realtime: "~33x",
+        // LibriSpeech test-clean, transcribe.cpp's published conversion
+        // benchmark (`catalog/orukeet.json`); not measured in Hex.
+        word_error_rate: Some(1.86),
+        streams: false,
+        runtime: ModelRuntime::Gguf(&ORUKEET_ARTIFACT),
+        languages: PARAKEET_V3_LANGUAGES,
+        // Like v3, its base: it detects the language from the audio and has
+        // no language input, so it is offered under Auto.
+        accepts_language_hint: false,
+        supports_language_detection: true,
     },
     ModelDefinition {
         id: TranscriptionModelId::WhisperLargeV3Turbo,
@@ -512,9 +562,9 @@ pub const MODELS: &[ModelDefinition] = &[
         runtime: ModelRuntime::Gguf(&PARAKEET_ULTRA_ARTIFACT),
         languages: PARAKEET_V3_LANGUAGES,
         // Like v3, its base: it detects the language from the audio and has
-        // no language input.
+        // no language input, so it is offered under Auto.
         accepts_language_hint: false,
-        supports_language_detection: false,
+        supports_language_detection: true,
     },
     ModelDefinition {
         id: TranscriptionModelId::Nemotron35Asr,
@@ -550,6 +600,40 @@ pub const MODELS: &[ModelDefinition] = &[
         // Russian only: it has no language input.
         accepts_language_hint: false,
         supports_language_detection: false,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::NbWhisperMedium,
+        name: "NB-Whisper Medium",
+        // On apollo's Vulkan GPU it ran FLEURS Norwegian at 0.89 times
+        // Whisper large-v3-turbo's speed (37x and 41x real time).
+        realtime: "~17x",
+        // FLEURS Norwegian test, Hex's run (`model_benchmarks`): Whisper
+        // large-v3-turbo scored 8.94% on the same run.
+        word_error_rate: Some(6.68),
+        streams: false,
+        runtime: ModelRuntime::Gguf(&NB_WHISPER_MEDIUM_ARTIFACT),
+        // Measured only for Bokmål with the `no` hint, which it always gets.
+        languages: &["no"],
+        accepts_language_hint: true,
+        supports_language_detection: false,
+    },
+    ModelDefinition {
+        id: TranscriptionModelId::GraniteSpeech5,
+        name: "Granite Speech 5.0",
+        // On apollo's Vulkan GPU it ran 2.1 to 2.4 times as fast as Whisper
+        // large-v3-turbo and 0.4 to 0.64 times Parakeet v3's speed (an 11 s
+        // clip, and the FLEURS English and Japanese test splits).
+        realtime: "~25x",
+        // FLEURS English test, Hex's run (`model_benchmarks`).
+        word_error_rate: Some(4.77),
+        streams: false,
+        runtime: ModelRuntime::Gguf(&GRANITE_SPEECH_5_ARTIFACT),
+        languages: GRANITE_SPEECH_5_LANGUAGES,
+        // A CTC head with no language input: it transcribes whichever of
+        // its seven languages it hears, so it is offered under Auto even
+        // though its pinned file leaves stt.capability.lang_detect off.
+        accepts_language_hint: false,
+        supports_language_detection: true,
     },
     ModelDefinition {
         id: TranscriptionModelId::AppleSpeech,
@@ -591,8 +675,8 @@ pub fn all_models() -> Vec<&'static ModelDefinition> {
 pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
     use Recommendation::{Fastest, MostAccurate, Recommended, Vocabulary};
     use TranscriptionModelId::{
-        CohereTranscribe, GigaAmV3, IvritWhisperLargeV3Turbo, ParakeetUnifiedEnglish, ParakeetV3,
-        Qwen3Asr06B, SenseVoiceSmall, WhisperLargeV3Turbo,
+        CohereTranscribe, GigaAmV3, IvritWhisperLargeV3Turbo, NbWhisperMedium,
+        ParakeetUnifiedEnglish, ParakeetV3, Qwen3Asr06B, SenseVoiceSmall, WhisperLargeV3Turbo,
     };
     let choices: &[(TranscriptionModelId, Recommendation)] = match language {
         AUTO_LANGUAGE => &[(WhisperLargeV3Turbo, Recommended), (Qwen3Asr06B, Fastest)],
@@ -610,6 +694,9 @@ pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
             (Qwen3Asr06B, Recommended),
             (WhisperLargeV3Turbo, Vocabulary),
         ],
+        // FLEURS Japanese test: Granite Speech 5.0 tied Whisper turbo
+        // (5.04% CER against 5.02%) at 2.4 times its speed, without
+        // vocabulary, so it stays unbadged (Hex's run).
         "ja" => &[
             (WhisperLargeV3Turbo, Recommended),
             (SenseVoiceSmall, Fastest),
@@ -633,6 +720,12 @@ pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
         // FLEURS Russian test: 5.37% WER against Parakeet v3's 6.52%, and
         // Whisper turbo's 5.36% at a fifth of its speed (Hex's run).
         "ru" => &[(GigaAmV3, Recommended), (WhisperLargeV3Turbo, Vocabulary)],
+        // FLEURS Norwegian test: 6.68% WER against Whisper turbo's 8.94%, at
+        // 0.89 times its speed and 60% of its download (Hex's run).
+        "no" => &[
+            (NbWhisperMedium, Recommended),
+            (WhisperLargeV3Turbo, Vocabulary),
+        ],
         "vi" => &[
             (Qwen3Asr06B, Recommended),
             (CohereTranscribe, MostAccurate),
@@ -749,7 +842,7 @@ pub fn models_dir() -> Result<PathBuf> {
     if let Some(directory) = TEST_MODELS_DIR.with(|directory| directory.borrow().clone()) {
         return Ok(directory);
     }
-    Ok(crate::app_paths::support_dir()?.join("models"))
+    crate::app_paths::models_dir()
 }
 
 #[cfg(test)]
@@ -1348,6 +1441,28 @@ mod tests {
     }
 
     #[test]
+    fn orukeet_is_offered_for_exactly_parakeet_v3s_languages_and_never_badged() {
+        let orukeet = definition(TranscriptionModelId::Orukeet);
+        let v3 = definition(TranscriptionModelId::ParakeetV3);
+        assert_eq!(orukeet.languages, PARAKEET_V3_LANGUAGES);
+        assert_eq!(orukeet.language_choices(), v3.language_choices());
+        assert!(!orukeet.streams);
+        assert!(!orukeet.accepts_language_hint);
+        assert!(orukeet.supports_language_detection);
+        assert!(!orukeet.id.is_labs_gated());
+        assert!(orukeet.available());
+        assert!(super::super::model_details::details(orukeet.id).is_some());
+        for language in v3.languages.iter().copied().chain([AUTO_LANGUAGE]) {
+            assert!(
+                choices_for_runtime(language)
+                    .iter()
+                    .all(|choice| choice.model.id != orukeet.id),
+                "Orukeet is never recommended ({language})"
+            );
+        }
+    }
+
+    #[test]
     fn parakeet_ultra_is_offered_only_with_its_lab_and_a_saved_choice_survives() {
         let ultra = definition(TranscriptionModelId::ParakeetUltra);
         assert_eq!(ultra.available(), crate::labs::parakeet_ultra());
@@ -1412,6 +1527,49 @@ mod tests {
         assert_eq!(ivrit.runtime_language_hint("he"), Some("he"));
         assert!(!ivrit.supports_language(AUTO_LANGUAGE));
         assert_eq!(language_name("he"), "Hebrew");
+    }
+
+    #[test]
+    fn an_import_offers_every_language_it_declares_by_name() {
+        let import = ModelDefinition {
+            languages: &["en", "nn", "no"],
+            supports_language_detection: true,
+            ..*definition(TranscriptionModelId::WhisperLargeV3Turbo)
+        };
+        assert_eq!(import.language_choices(), [AUTO_LANGUAGE, "en", "no", "nn"]);
+        assert_eq!(language_name("nn"), "Norwegian Nynorsk");
+        assert!(
+            !definition(TranscriptionModelId::WhisperLargeV3Turbo)
+                .language_choices()
+                .contains(&"nn")
+        );
+    }
+
+    #[test]
+    fn norwegian_recommends_nb_whisper_with_its_hint() {
+        use Recommendation::{Recommended, Vocabulary};
+        use TranscriptionModelId::{NbWhisperMedium, WhisperLargeV3Turbo};
+        let norwegian: Vec<_> = choices_for_runtime("no")
+            .into_iter()
+            .map(|choice| (choice.model.id, choice.recommendation))
+            .collect();
+        assert_eq!(
+            norwegian,
+            [
+                (NbWhisperMedium, Recommended),
+                (WhisperLargeV3Turbo, Vocabulary)
+            ]
+        );
+        let nb = definition(NbWhisperMedium);
+        assert_eq!(nb.language_choices(), ["no"]);
+        assert_eq!(nb.runtime_language_hint("no"), Some("no"));
+        assert!(!nb.supports_language(AUTO_LANGUAGE));
+        assert!(
+            definition(WhisperLargeV3Turbo)
+                .language_choices()
+                .contains(&"no")
+        );
+        assert_eq!(language_name("no"), "Norwegian");
     }
 
     #[test]
@@ -1523,13 +1681,15 @@ mod tests {
 
     #[test]
     fn gguf_artifacts_are_q8_0_for_the_vulkan_shader_subset() {
-        // Q8_0 GGUFs hold only f32, f16, and q8_0 tensors, the types the
-        // Vulkan backend is built for (`CMAKE_ARGS` in .cargo/config.toml).
-        // Another quantization needs its type added there, or Vulkan aborts.
+        // Q8_0 GGUFs hold only f32, f16, and q8_0 tensors, and NB-Whisper's
+        // whisper.cpp file q5_0 too: the types the Vulkan backend is built
+        // for (`CMAKE_ARGS` in .cargo/config.toml). Another quantization
+        // needs its type added there, or Vulkan aborts.
         for model in MODELS {
             if let ModelRuntime::Gguf(artifact) = model.runtime {
                 assert!(
-                    artifact.filename.ends_with("-Q8_0.gguf"),
+                    artifact.filename.ends_with("-Q8_0.gguf")
+                        || artifact.filename == "ggml-model-q5_0.bin",
                     "{} needs its tensor types in GGML_VULKAN_SHADER_TYPES",
                     artifact.filename
                 );
@@ -1589,6 +1749,7 @@ mod tests {
             ),
             (TranscriptionModelId::ParakeetV2, "parakeet_v2"),
             (TranscriptionModelId::ParakeetV3, "parakeet_v3"),
+            (TranscriptionModelId::Orukeet, "orukeet"),
             (
                 TranscriptionModelId::WhisperLargeV3Turbo,
                 "whisper_large_v3_turbo",
@@ -1612,6 +1773,7 @@ mod tests {
             (TranscriptionModelId::ParakeetUltra, "parakeet_ultra"),
             (TranscriptionModelId::Nemotron35Asr, "nemotron_3_5_asr"),
             (TranscriptionModelId::GigaAmV3, "gigaam_v3"),
+            (TranscriptionModelId::NbWhisperMedium, "nb_whisper_medium"),
             (TranscriptionModelId::AppleSpeech, "apple_speech"),
         ] {
             assert_eq!(id.as_str(), name);
@@ -1666,6 +1828,24 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn models_that_detect_language_without_a_hint_offer_auto() {
+        for model in [
+            TranscriptionModelId::ParakeetV3,
+            TranscriptionModelId::GraniteSpeech5,
+        ] {
+            let definition = definition(model);
+            assert!(!definition.accepts_language_hint, "{model:?}");
+            assert!(definition.supports_language_detection, "{model:?}");
+            assert!(definition.language_choices().contains(&AUTO_LANGUAGE));
+            assert_eq!(definition.language_for(AUTO_LANGUAGE), AUTO_LANGUAGE);
+        }
+        let v2 = definition(TranscriptionModelId::ParakeetV2);
+        assert!(!v2.supports_language_detection);
+        assert!(!v2.language_choices().contains(&AUTO_LANGUAGE));
+        assert_eq!(v2.language_for(AUTO_LANGUAGE), "en");
     }
 
     #[test]
@@ -1940,7 +2120,8 @@ mod tests {
                 WhisperLargeV3Turbo,
                 Qwen3Asr06B,
                 QwenCleoAsr17B,
-                IvritWhisperLargeV3Turbo
+                IvritWhisperLargeV3Turbo,
+                NbWhisperMedium
             ]
         );
         assert_eq!(
@@ -1949,6 +2130,7 @@ mod tests {
                 ParakeetUnifiedEnglish,
                 ParakeetV2,
                 ParakeetV3,
+                Orukeet,
                 UnderdogBark3Pro,
                 UnderdogBark3Clean,
                 ParakeetUltra,

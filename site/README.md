@@ -8,8 +8,11 @@ both Workers. CI deploys them, never a laptop: Site builds without secrets and
 `.github/release/deploy-site.sh` deploys the verified Build Output
 (`cf deploy --prebuilt --mode <mode>`), refusing any Worker, route, or binding
 other than this config's (docs/releasing.md). `worker.ts` serves the
-site and, at `/hex/files/`, the environment's R2 bucket of release files, and
-301s other hosts and plain HTTP to the canonical host.
+site and, at `/hex/files/`, the release files: the installers and legacy
+appcast built with the site, the dev notes from the Release workflow's
+`dev-notes` branch, and the frozen 2.3.1 feeds and artifacts read from
+`hex-production-files`. It 301s other hosts and plain HTTP to the canonical
+host.
 
 The download section (`src/Download.tsx`) is one install switcher and nothing
 else: macOS, Windows, and Linux tabs of equal width with a sliding pill, each
@@ -63,15 +66,27 @@ HEX_SITE_URL=http://127.0.0.1:5531 bun run generate:poster
 
 ## Performance
 
-`perf/hex.bench.ts` is a [strobe](https://github.com/Hona/strobe) bench: load to
+`perf/hex.bench.ts` is a [strobe](https://github.com/anomalyco/strobe) bench: load to
 the live head, the idle head for 8 s, and the first 20 s of the show after a click
 on the key. `strobe.json` builds the site and serves the Build Output under `/hex/`
-with `perf/serve.ts`. From the repository root, against a checkout of `dev` that
-has the same two files:
+with `perf/serve.ts`. strobe builds and serves both variants with this checkout's
+`strobe.json` and `perf/`, so any commit works as the base. From the repository root:
 
 ```sh
-strobe bench site/perf/hex.bench.ts --base <dev checkout> --head .
+strobe bench site/perf/hex.bench.ts --base origin/dev --head .
+strobe bench site/perf/hex.bench.ts --head . --check            # each case once, pass or fail
+strobe report experiment <exp_…> --format pr --update-pr <n>     # the results block in PR n
 ```
+
+In a PR, write your own text (what strobe showed, what changed) and let
+`--update-pr` place strobe's generated results block: it replaces only its own
+block after a rerun. Don't edit inside it. The bench's `expect` refuses a block
+whose page isn't the landing page (`WrongScreen`).
+
+The show draws at its own frame rate, not the display's: `canvas.frames` and
+`canvas.interval.p95` count the show's WebGPU frames, where presented frames count
+the display's refreshes. `gpu.compile` is the GPU process's shader and pipeline work
+during a load.
 
 ## Social image
 

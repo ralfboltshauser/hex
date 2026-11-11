@@ -359,6 +359,16 @@ pub enum AudioIn {
     Microphone,
 }
 
+/// How a screen capture's movie is recorded (macOS; elsewhere always compact).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MovieQuality {
+    /// Sized for agents: H.264, 1280 px long edge (2560 for a whole display, for crops).
+    #[default]
+    Compact,
+    /// For people: every pixel, as hardware HEVC (`capture_core::Encoder::Hevc`).
+    Full,
+}
+
 #[derive(Clone, Debug)]
 pub struct Start {
     /// The capture's start on the boot-time nanosecond clock that audio and input timestamps share.
@@ -368,6 +378,7 @@ pub struct Start {
     pub audio: AudioIn,
     pub window_log: bool,
     pub note: Option<String>,
+    pub movie: MovieQuality,
 }
 
 impl Default for Start {
@@ -379,20 +390,17 @@ impl Default for Start {
             audio: AudioIn::External,
             window_log: true,
             note: None,
+            movie: MovieQuality::Compact,
         }
     }
 }
 
 impl Start {
     pub fn screen(target: TargetInfo) -> Self {
-        let window_log = target.mode == CaptureMode::Display;
         Self {
-            t0_boot_ns: boot_time_ns(),
+            window_log: target.mode == CaptureMode::Display,
             target: Target::Screen(target),
-            bundle_dir: None,
-            audio: AudioIn::External,
-            window_log,
-            note: None,
+            ..Self::default()
         }
     }
 
@@ -407,12 +415,10 @@ impl Start {
 
     pub fn phone(device: Option<String>, name: Option<String>) -> Self {
         Self {
-            t0_boot_ns: boot_time_ns(),
             target: Target::Phone { device, name },
-            bundle_dir: None,
             audio: AudioIn::None,
             window_log: false,
-            note: None,
+            ..Self::default()
         }
     }
 }
@@ -857,6 +863,8 @@ pub fn capture_size(target: &TargetInfo, long_edge: f64) -> (u32, u32) {
 pub(crate) struct Sampler {
     pub target: TargetInfo,
     pub video_output_path: Option<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub movie_quality: MovieQuality,
     /// Scrawl's own windows to leave out of the recording.
     #[cfg_attr(any(target_os = "windows", target_os = "linux"), allow(dead_code))]
     pub excluded_window_ids: Arc<Mutex<Vec<u32>>>,
@@ -903,6 +911,7 @@ impl ScreenCaptureSession {
             excluded_window_ids,
             Arc::default(),
             CANDIDATE_BUDGET_BYTES,
+            MovieQuality::Compact,
         )
     }
 
@@ -912,6 +921,7 @@ impl ScreenCaptureSession {
         excluded_window_ids: Arc<Mutex<Vec<u32>>>,
         own_windows_recorded: Arc<AtomicBool>,
         budget_bytes: usize,
+        movie_quality: MovieQuality,
     ) -> Self {
         let started_at = Instant::now();
         #[cfg(target_os = "macos")]
@@ -932,6 +942,7 @@ impl ScreenCaptureSession {
                 platform::run_sampler(Sampler {
                     target: sampler_target,
                     video_output_path,
+                    movie_quality,
                     excluded_window_ids,
                     own_windows_recorded,
                     started_at,
@@ -2210,8 +2221,35 @@ pub fn is_frontmost_terminal() -> bool {
 }
 
 /// Writes all bundle artifacts (`scrawl.json`, `summary.md`, `contact-sheet.png`, `frames/frame-XX.png`)
-/// into a new or specified `.scrawl` bundle directory.
+/// into a new or specified `.scrawl` bundle directory. The manifest comes last, whole, so a
+/// bundle with one is complete.
 pub fn write_bundle_artifacts(
+    out_dir: &Path,
+    bundle: &crate::model::ScrawlBundle,
+    annotated_frames: &[(crate::model::Keyframe, RgbaFrame)],
+    contact_sheet: &RgbaFrame,
+    summary_md: &str,
+) -> Result<()> {
+    write_bundle_files(out_dir, bundle, annotated_frames, contact_sheet, summary_md)?;
+    publish_manifest(out_dir, bundle)
+}
+
+/// Writes `scrawl.json` atomically (a temporary file renamed into place): the last step of a
+/// build, which marks the bundle finished.
+pub fn publish_manifest(out_dir: &Path, bundle: &crate::model::ScrawlBundle) -> Result<()> {
+    let manifest_bytes = serde_json::to_vec_pretty(bundle)?;
+    let tmp = out_dir.join(".scrawl.json.tmp");
+    crate::routing::undo::write_private(&tmp, &manifest_bytes)
+        .with_context(|| format!("could not write {}", tmp.display()))?;
+    if let Err(error) = std::fs::rename(&tmp, out_dir.join("scrawl.json")) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error).context("could not publish scrawl.json");
+    }
+    Ok(())
+}
+
+/// Everything [`write_bundle_artifacts`] writes except the manifest.
+pub fn write_bundle_files(
     out_dir: &Path,
     bundle: &crate::model::ScrawlBundle,
     annotated_frames: &[(crate::model::Keyframe, RgbaFrame)],
@@ -2244,8 +2282,6 @@ pub fn write_bundle_artifacts(
         Ok(())
     })?;
 
-    let manifest_bytes = serde_json::to_vec_pretty(bundle)?;
-    crate::routing::undo::write_private(&out_dir.join("scrawl.json"), &manifest_bytes)?;
     crate::routing::undo::write_private(&out_dir.join("summary.md"), summary_md.as_bytes())?;
 
     Ok(())
@@ -2667,6 +2703,7 @@ impl Engine {
                     Arc::clone(&telemetry.excluded_window_ids),
                     Arc::clone(&own.recorded),
                     engine_cfg.candidate_budget_bytes(),
+                    req.movie,
                 );
                 self.host
                     .metric("sck_start_ms", stage.elapsed().as_secs_f64() * 1_000.0);
@@ -4008,7 +4045,7 @@ mod tests {
         assert_eq!(capture_size(&display, CANDIDATE_EDGE), (480, 310));
         let region = target(CaptureMode::Region, 480.0, 320.0);
         assert_eq!(capture_size(&region, CANDIDATE_EDGE), (480, 320));
-        if cfg!(target_os = "windows") {
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
             // Frames are in pixels: never upscaled past the screen's own.
             assert_eq!(capture_size(&display, 2560.0), (1728, 1116));
             assert_eq!(capture_size(&region, 1280.0), (480, 320));

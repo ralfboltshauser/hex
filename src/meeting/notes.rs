@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::generator::{self, GeneratedNotes, GenerationError};
+use super::generator::{self, GeneratedNotes, GenerationError, NotesWriter};
 use super::{
     MeetingManifest, MeetingStatus, TranscriptEntry, TranscriptReader, coalesce_transcript,
     format_duration, read_manifest, root, sync_directory, write_manifest,
@@ -85,6 +85,10 @@ pub struct MeetingNotes {
     pub excerpt_chars: usize,
     #[serde(default)]
     pub transcript_chars: usize,
+    /// The writer, and for OpenCode its `provider/model`. Notes written
+    /// before Hex recorded it have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<NotesWriter>,
 }
 
 impl MeetingNotes {
@@ -247,7 +251,7 @@ pub(super) fn summarize_entries(
     deadline: Instant,
     generate: impl FnMut(&str, &str, Duration) -> Result<GeneratedNotes, GenerationError>,
 ) -> Result<Summary> {
-    summarize_with_calendar(entries, None, max_chars, deadline, generate)
+    summarize_with_calendar(entries, None, &[], max_chars, deadline, generate)
 }
 
 /// The most attendee names a notes prompt lists.
@@ -281,15 +285,22 @@ fn calendar_preamble(calendar: Option<&super::MeetingCalendar>) -> String {
     preamble
 }
 
-/// [`summarize_entries`] with the calendar event as context.
+/// [`summarize_entries`] with the vocabulary's `terms` (Labs › Vocabulary
+/// in meeting notes; empty leaves them out) and the calendar event as
+/// context. Both count against the excerpt budget.
 pub(super) fn summarize_with_calendar(
     entries: &[TranscriptEntry],
     calendar: Option<&super::MeetingCalendar>,
+    terms: &[String],
     max_chars: usize,
     deadline: Instant,
     mut generate: impl FnMut(&str, &str, Duration) -> Result<GeneratedNotes, GenerationError>,
 ) -> Result<Summary> {
-    let preamble = calendar_preamble(calendar);
+    let preamble = format!(
+        "{}{}",
+        super::chapters::vocabulary_line(terms),
+        calendar_preamble(calendar)
+    );
     let mut max_chars = max_chars.saturating_sub(preamble.len()).max(1);
     let mut calls = 0;
     loop {
@@ -299,7 +310,7 @@ pub(super) fn summarize_with_calendar(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(eyre!("Apple Intelligence did not finish in time"));
+            return Err(eyre!("the notes writer did not finish in time"));
         }
         calls += 1;
         let prompt = format!("{preamble}Meeting transcript:\n\n{}", excerpt.text);
@@ -309,6 +320,7 @@ pub(super) fn summarize_with_calendar(
                     notes: GeneratedNotes {
                         title: clean_title(&notes.title),
                         summary: clean_summary(&notes.summary),
+                        written_by: notes.written_by,
                     },
                     excerpt_chars: excerpt.text.len(),
                     transcript_chars: excerpt.transcript_chars,
@@ -377,6 +389,7 @@ impl MeetingNotes {
             elapsed_ms: elapsed.as_millis() as u64,
             excerpt_chars: summary.excerpt_chars,
             transcript_chars: summary.transcript_chars,
+            written_by: summary.notes.written_by,
         }
     }
 }
@@ -422,13 +435,48 @@ fn base_title(manifest: &MeetingManifest) -> String {
 pub(super) fn render_notes_block(notes: &MeetingNotes) -> String {
     let summary = notes.summary.trim();
     format!(
-        "{NOTES_START}\n## Summary\n\n{}\n\n_Written on this Mac by Apple Intelligence; the transcript below has the details._\n{NOTES_END}\n",
+        "{NOTES_START}\n## Summary\n\n{}\n\n_{}_\n{NOTES_END}\n",
         if summary.is_empty() {
             "_Nothing to summarize._"
         } else {
             summary
-        }
+        },
+        notes_footer(notes.written_by.as_ref()),
     )
+}
+
+/// The line under the summary, naming the writer that actually wrote it.
+pub(super) fn notes_footer(writer: Option<&NotesWriter>) -> String {
+    notes_footer_for(
+        writer,
+        "the transcript below has the details.",
+        "The transcript below has the details.",
+    )
+}
+
+/// The line under the separate notes file's summary: the same writer, but
+/// pointing at the linked transcript rather than the one below.
+pub(super) fn notes_file_footer(writer: Option<&NotesWriter>) -> String {
+    notes_footer_for(
+        writer,
+        "the transcript has the details.",
+        "The transcript has the details.",
+    )
+}
+
+fn notes_footer_for(writer: Option<&NotesWriter>, details: &str, without_a_writer: &str) -> String {
+    match writer {
+        Some(NotesWriter::AppleIntelligence) => {
+            format!("Written on this Mac by Apple Intelligence; {details}")
+        }
+        Some(NotesWriter::OpenCode { model: Some(model) }) => {
+            format!("Written by {model} through OpenCode; {details}")
+        }
+        Some(NotesWriter::OpenCode { model: None }) => {
+            format!("Written by OpenCode's default model; {details}")
+        }
+        None => without_a_writer.into(),
+    }
 }
 
 /// How far a recording has come, for deciding when to name it.
@@ -602,7 +650,7 @@ pub(super) fn provisional_title(
     let title =
         clean_title(&generate(TITLE_INSTRUCTIONS, &prompt, timeout).map_err(|e| eyre!("{e}"))?);
     if title.is_empty() {
-        return Err(eyre!("Apple Intelligence returned an empty title"));
+        return Err(eyre!("the notes writer returned an empty title"));
     }
     Ok(title)
 }
@@ -687,7 +735,8 @@ pub(super) fn retitle_markdown_file(
     })
 }
 
-/// Applies the notes to the exported file in place, keeping its name.
+/// Applies the notes to the exported file in place; the caller renames it
+/// to the new title when Labs › Descriptive meeting file names is on.
 fn update_markdown_file(
     path: &Path,
     written: &mut Option<String>,
@@ -698,6 +747,33 @@ fn update_markdown_file(
     rewrite_markdown_file(path, written, |markdown| {
         apply_notes(markdown, previous_title, title, block)
     })
+}
+
+/// Applies the notes to the exported file and, with Labs › Descriptive
+/// meeting file names on, renames it to the new title. A missing file is
+/// left to the manifest alone. A separate notes file is written beside it
+/// while Labs › Separate notes file is on.
+fn apply_notes_to_export(
+    manifest: &mut MeetingManifest,
+    previous_title: &str,
+    title: &str,
+    descriptive_filenames: bool,
+    separate_notes: bool,
+) -> Result<()> {
+    let Some(path) = manifest.export_path.clone().filter(|path| path.exists()) else {
+        return Ok(());
+    };
+    let block = render_notes_block(manifest.notes.as_ref().expect("notes were set"));
+    update_markdown_file(
+        &path,
+        &mut manifest.export_sha256,
+        previous_title,
+        title,
+        &block,
+    )?;
+    super::export_name::rename_to_title(manifest, title, descriptive_filenames);
+    super::notes_file::write_after_notes(manifest, separate_notes);
+    Ok(())
 }
 
 /// The file is replaced atomically, and only if nothing changed it meanwhile.
@@ -799,21 +875,35 @@ pub fn summarize(id: &str) -> Result<MeetingManifest> {
 
 /// Generates and records notes while holding this meeting's claim.
 fn summarize_claimed(id: &str, _claim: InProgress) -> Result<MeetingManifest> {
-    generator::available().map_err(|reason| eyre!("{reason}"))?;
     let directory = root()?.join(id);
-    let manifest = read_manifest(&directory)?;
+    let mut manifest = read_manifest(&directory)?;
     if manifest.status != MeetingStatus::Complete {
         return Err(eyre!("only completed meetings can be summarized"));
+    }
+    // A writer that isn't there (OpenCode not running, Apple Intelligence
+    // off) is the meeting's notes error, so the pane says why.
+    if let Err(reason) = generator::available() {
+        tracing::warn!(%reason, meeting = id, "could not generate meeting notes");
+        manifest.notes_error = Some(reason.clone());
+        write_manifest(&directory, &manifest)?;
+        return Err(eyre!("{reason}"));
     }
     let entries = super::read_ndjson(&directory.join("transcript.ndjson"))?;
     let never = AtomicBool::new(false);
     if crate::labs::live_chapters() {
         super::chapters::refine_meeting(&directory, &entries, &never);
     }
+    // Read at each generation, so Regenerate summary uses the current list.
+    let terms = if crate::labs::meeting_notes_vocabulary() {
+        crate::dictation::vocabulary::terms()
+    } else {
+        Vec::new()
+    };
     let started = Instant::now();
     let result = summarize_with_calendar(
         &entries,
         manifest.calendar.as_ref(),
+        &terms,
         excerpt_budget(generator::context_tokens(), FINAL_EXCERPT_CHARS),
         started + TOTAL_DEADLINE,
         |instructions, prompt, timeout| {
@@ -837,18 +927,15 @@ fn summarize_claimed(id: &str, _claim: InProgress) -> Result<MeetingManifest> {
             manifest.notes = Some(MeetingNotes::from_summary(summary, started.elapsed()));
             manifest.notes_error = None;
             let title = display_title(&manifest);
-            if let Some(path) = manifest.export_path.clone().filter(|path| path.exists()) {
-                let block = render_notes_block(manifest.notes.as_ref().expect("notes were set"));
-                if let Err(error) = update_markdown_file(
-                    &path,
-                    &mut manifest.export_sha256,
-                    &previous_title,
-                    &title,
-                    &block,
-                ) {
-                    tracing::warn!(%error, meeting = id, "could not add notes to meeting Markdown");
-                    manifest.notes_error = Some(format!("Notes not added to Markdown: {error}"));
-                }
+            if let Err(error) = apply_notes_to_export(
+                &mut manifest,
+                &previous_title,
+                &title,
+                crate::labs::meeting_descriptive_filenames(),
+                crate::labs::meeting_notes_file(),
+            ) {
+                tracing::warn!(%error, meeting = id, "could not add notes to meeting Markdown");
+                manifest.notes_error = Some(format!("Notes not added to Markdown: {error}"));
             }
             write_manifest(&directory, &manifest)?;
             Ok(manifest)
@@ -1032,6 +1119,7 @@ mod tests {
         GeneratedNotes {
             title: title.into(),
             summary: summary.into(),
+            ..Default::default()
         }
     }
 
@@ -1095,6 +1183,7 @@ mod tests {
         summarize_with_calendar(
             &conversation(2),
             Some(&calendar),
+            &[],
             FINAL_EXCERPT_CHARS,
             Instant::now() + Duration::from_secs(60),
             |_, prompt, _| {
@@ -1106,6 +1195,67 @@ mod tests {
         assert!(prompts[0].starts_with(
             "Calendar event: Q4 launch sync\nAttendees: Ana Ruiz, Ben Ito\n\nMeeting transcript:\n\n[00:00] You: Turn 0"
         ));
+    }
+
+    #[test]
+    fn vocabulary_terms_lead_the_notes_prompt_and_share_its_budget() {
+        let calendar = crate::meeting::MeetingCalendar {
+            title: "Q4 launch sync".into(),
+            attendees: vec!["Ana Ruiz".into()],
+        };
+        let terms = vec!["Kubernetes".to_string(), "Ana Ruiz".to_string()];
+        let mut prompts = Vec::new();
+        summarize_with_calendar(
+            &conversation(2),
+            Some(&calendar),
+            &terms,
+            FINAL_EXCERPT_CHARS,
+            Instant::now() + Duration::from_secs(60),
+            |_, prompt, _| {
+                prompts.push(prompt.to_string());
+                Ok(generated("Launch", "They met."))
+            },
+        )
+        .unwrap();
+        assert!(prompts[0].starts_with(
+            "Names and terms that may appear: Kubernetes, Ana Ruiz\n\nCalendar event: Q4 launch sync\nAttendees: Ana Ruiz\n\nMeeting transcript:\n\n[00:00] You: Turn 0"
+        ));
+
+        // No terms: the prompt is the one Hex sent before.
+        let mut without = Vec::new();
+        summarize_with_calendar(
+            &conversation(2),
+            None,
+            &[],
+            FINAL_EXCERPT_CHARS,
+            Instant::now() + Duration::from_secs(60),
+            |_, prompt, _| {
+                without.push(prompt.to_string());
+                Ok(generated("Launch", "They met."))
+            },
+        )
+        .unwrap();
+        assert!(without[0].starts_with("Meeting transcript:\n\n[00:00] You: Turn 0"));
+
+        // The vocabulary line comes out of the transcript's budget.
+        let entries = conversation(400);
+        let budget = 6_000;
+        let line = crate::meeting::chapters::vocabulary_line(&terms).len();
+        let mut excerpts = Vec::new();
+        for terms in [&[][..], &terms[..]] {
+            let summary = summarize_with_calendar(
+                &entries,
+                None,
+                terms,
+                budget,
+                Instant::now() + Duration::from_secs(60),
+                |_, _, _| Ok(generated("Launch", "They met.")),
+            )
+            .unwrap();
+            excerpts.push(summary.excerpt_chars);
+        }
+        assert!(excerpts[0] <= budget, "{excerpts:?}");
+        assert!(excerpts[1] <= budget - line, "{excerpts:?}");
     }
 
     #[test]
@@ -1343,6 +1493,34 @@ mod tests {
     }
 
     #[test]
+    fn the_notes_footer_names_the_writer_that_wrote_them() {
+        let mut notes = meeting_notes();
+        assert!(!render_notes_block(&notes).contains("Apple Intelligence"));
+
+        notes.written_by = Some(NotesWriter::AppleIntelligence);
+        assert!(render_notes_block(&notes).contains("Written on this Mac by Apple Intelligence"));
+
+        notes.written_by = Some(NotesWriter::OpenCode {
+            model: Some("openai/gpt-5".into()),
+        });
+        let block = render_notes_block(&notes);
+        assert!(block.contains("Written by openai/gpt-5 through OpenCode"));
+        assert!(!block.contains("Apple Intelligence") && !block.contains("this Mac"));
+
+        // The manifest keeps the writer and model, and older notes still read.
+        let json = serde_json::to_value(&notes).unwrap();
+        assert_eq!(
+            json["written_by"],
+            serde_json::json!({"writer": "opencode", "model": "openai/gpt-5"})
+        );
+        let read: MeetingNotes = serde_json::from_value(json).unwrap();
+        assert_eq!(read.written_by, notes.written_by);
+        let older: MeetingNotes =
+            serde_json::from_value(serde_json::json!({"title": "Launch"})).unwrap();
+        assert_eq!(older.written_by, None);
+    }
+
+    #[test]
     fn user_edits_outside_the_notes_block_are_preserved() {
         let block = render_notes_block(&meeting_notes());
         let edited = EXPORT
@@ -1468,6 +1646,63 @@ mod tests {
         assert!(written.starts_with("# Launch plan review\n"));
         assert!(written.contains(NOTES_START));
         assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn notes_rename_the_export_only_with_descriptive_file_names() {
+        let folder = std::env::temp_dir().join(format!(
+            "hex-meeting-notes-name-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&folder).unwrap();
+        let stamp = super::super::transcript::LocalTime::from_ms(1_760_000_000_000).file_stamp();
+
+        let path = folder.join(format!("{stamp} Zoom call — 2-30 PM.md"));
+        fs::write(&path, EXPORT).unwrap();
+        let mut changed = manifest();
+        changed.export_path = Some(path.clone());
+        changed.export_sha256 = Some(super::super::text_sha256(EXPORT.as_bytes()));
+        changed.notes = Some(meeting_notes());
+        apply_notes_to_export(
+            &mut changed,
+            "Zoom call — 2:30 PM",
+            "Launch plan review",
+            true,
+            false,
+        )
+        .unwrap();
+        let renamed = changed.export_path.clone().unwrap();
+        assert_ne!(renamed, path);
+        assert!(!path.exists());
+        assert_eq!(
+            renamed.file_name().unwrap().to_string_lossy(),
+            format!("{stamp} Launch plan review.md")
+        );
+        let written = fs::read_to_string(&renamed).unwrap();
+        assert!(written.starts_with("# Launch plan review\n"));
+        assert!(written.contains(NOTES_START));
+        // The rename keeps the copy claimed for retention at its new path.
+        assert_eq!(super::super::file_sha256(&renamed), changed.export_sha256);
+
+        // Off, the notes rewrite the file in place and its name stays.
+        let kept = folder.join(format!("{stamp} Old name.md"));
+        fs::write(&kept, EXPORT).unwrap();
+        let mut unchanged = manifest();
+        unchanged.export_path = Some(kept.clone());
+        unchanged.notes = Some(meeting_notes());
+        apply_notes_to_export(
+            &mut unchanged,
+            "Zoom call — 2:30 PM",
+            "Launch plan review",
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(unchanged.export_path, Some(kept.clone()));
+        assert!(kept.exists());
+        assert!(fs::read_to_string(&kept).unwrap().contains(NOTES_START));
         fs::remove_dir_all(folder).unwrap();
     }
 }

@@ -1,4 +1,4 @@
-import { bench, web } from "@hona/strobe-bench"
+import { bench, web } from "@hona/strobe"
 
 // The landing page as a desktop visitor sees it: the prerendered page, then the show engine (WebGPU) takes over the
 // head once the browser is idle. data-live goes on the page once the engine has drawn the head.
@@ -10,8 +10,10 @@ export default bench({
     web: web({
       viewport: { width: 1440, height: 900 },
       url,
-      prepare: ({ playwright }) =>
-        playwright.page.addInitScript(() => {
+      // Every block must be on the landing page, not an error page or another route.
+      expect: { title: "Hex: voice dictation", url: "/hex/" },
+      prepare: ({ addInitScript }) =>
+        addInitScript(() => {
           // The show's own frames: one swapchain texture per drawn frame, as count.frame.
           if (typeof GPUCanvasContext === "undefined") return
           const take = GPUCanvasContext.prototype.getCurrentTexture
@@ -26,13 +28,13 @@ export default bench({
     // A returning visit, from navigation until the engine has drawn the head.
     "load to live head": {
       primary: "run.duration",
-      metrics: ["main.work"],
+      metrics: ["main.work", "gpu.compile"],
       run: ({ page }) => page.goto(url, { until: live }),
     },
     // The idle head breathing before anyone presses the key.
     "idle head 8 s": {
       primary: "main.busy",
-      metrics: ["main.work", "main.gc", "count.frame", "cpu.app.total", "gpu.process.3d", "frames.dropped.pct"],
+      metrics: ["main.work", "main.gc", "count.frame", "cpu.app.total", "gpu.process.3d", "frames.dropped.pct", "canvas.frames", "canvas.interval.p95"],
       run: ({ page }) => page.wait(8000),
     },
     // Press the option key: the first 20 s of the show (calm, the first OpenCode prompts).

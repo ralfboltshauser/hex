@@ -61,9 +61,15 @@ impl crate::control::host::Host for LinuxControl {
             .unwrap()
             .clone()
             .ok_or_else(|| ControlError::new("not-ready", "Hex is starting; try again"))?;
+        let mut listener = status.desktop.listener;
+        // A listener that couldn't start says why, as the window does
+        // ("Alt+Space is already in use by another X11 client").
+        if !listener.running && listener.warning.is_none() {
+            listener.warning = status.desktop.operation_error.clone();
+        }
         Ok(crate::control::host::HostState {
             capture: crate::control::host::capture_from_state(status.desktop.activity.state),
-            listener: status.desktop.listener,
+            listener,
             transcription: status.desktop.transcription,
             update: status.desktop.update_status,
             settings: status.settings,
@@ -90,11 +96,30 @@ impl crate::control::host::Host for LinuxControl {
             (CaptureAction::Toggle, false) => ShortcutCommand::DictationToggle,
             (CaptureAction::Toggle, true) => ShortcutCommand::DictationToggleRaw,
             (CaptureAction::Stop, _) => ShortcutCommand::DictationStop,
+            (CaptureAction::Cancel, _) => ShortcutCommand::DictationCancel,
         })
     }
 
     fn paste_last(&self) -> std::result::Result<(), ControlError> {
         self.shortcut(ShortcutCommand::PasteLast)
+    }
+
+    fn typed_text(&self) -> std::result::Result<(), ControlError> {
+        let settings = self.state()?.settings;
+        if !settings.labs.typed_text {
+            return Err(ControlError::new(
+                "disabled",
+                "Labs › Transform typed text is off; turn it on with `hex labs on typed-text`",
+            ));
+        }
+        if settings.paste_with_shift {
+            return Err(ControlError::new(
+                "disabled",
+                "Terminal paste is on, so typed text would send Ctrl+Shift+V; turn it \
+                 off in Settings › General first",
+            ));
+        }
+        self.shortcut(ShortcutCommand::TypedText)
     }
 
     fn save(&self, settings: AppSettings) -> std::result::Result<(), ControlError> {
@@ -185,6 +210,9 @@ impl crate::control::host::Host for LinuxControl {
             crate::control::ControlCommand::ScrawlCapture {
                 action: crate::control::ScrawlCaptureAction::Status,
             } => linux_service::capture_status(),
+            crate::control::ControlCommand::ScrawlCapture {
+                action: crate::control::ScrawlCaptureAction::Replay,
+            } => crate::control::host::unsupported("Annotate replay requires macOS 27 or later"),
             crate::control::ControlCommand::ScrawlCapture { action } => {
                 match crate::capture_host::send_to_listener(
                     crate::capture_host::CaptureControl::Scrawl(action),

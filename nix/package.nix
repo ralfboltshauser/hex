@@ -20,6 +20,7 @@
   fontconfig,
   freetype,
   curl,
+  util-linux,
   wl-clipboard,
   wtype,
   makeWrapper,
@@ -69,6 +70,23 @@ let
     # Annotate runs ffmpeg and ffprobe; the headless build includes libx264.
     ffmpeg-headless
   ];
+  # Every Git dependency Cargo.lock pins, with the revision its output hash was
+  # computed from. scripts/check-nix-git-pins.py fails a pull request that bumps
+  # one without the other, before Nix reports a hash mismatch.
+  cargoGitDependencies = {
+    "transcribe-rs-0.3.11" = {
+      rev = "e37c66b6df43af51fde8dec34f98a07aaf09564c";
+      hash = "sha256-MJJiug3LfbKsuHcL2+LJk95+j5kk/MWzb5ihdBlHLmE=";
+    };
+    "rune-0.0.1" = {
+      rev = "ba5e7c8069a24c36f95ca90a3058083cd468fcd1";
+      hash = "sha256-D0zeghVhWooVKQtxObxQDnGdMO0Zgo6uKrCWi7tVHEo=";
+    };
+    "transcribe-cpp-sys-0.4.1" = {
+      rev = "bcb639faa4c74a2300ba19e30360cb2355b1663a";
+      hash = "sha256-1VztJ0VhPTjAuk4J0NT9KapDOqplegpHOqHsTpfHXWc=";
+    };
+  };
 in
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "hex";
@@ -89,16 +107,14 @@ rustPlatform.buildRustPackage (finalAttrs: {
       ../assets
       ../packaging
       ../macos/HexMicrophoneDriver/Info.plist
+      # Built in: a 2.3.1 install moves itself into this installer's layout.
+      ../.github/release/install-linux.sh
     ];
   };
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    outputHashes = {
-      "transcribe-rs-0.3.11" = "sha256-MJJiug3LfbKsuHcL2+LJk95+j5kk/MWzb5ihdBlHLmE=";
-      "rune-0.0.1" = "sha256-zYMGfhtkhGLrTj139TfRhDyt9ZEsQ0lr9cAlu/gGgcI=";
-      "transcribe-cpp-sys-0.4.1" = "sha256-AP8+t4baAzjOVJo76vodPoWv8lrFLR2tsXvsrbMFeSk=";
-    };
+    outputHashes = builtins.mapAttrs (_: dependency: dependency.hash) cargoGitDependencies;
   };
 
   nativeBuildInputs = [
@@ -127,8 +143,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
     libxi
   ];
 
-  # OpenCode HTTP requests run through curl, including in the tests.
-  nativeCheckInputs = [ curl ];
+  # OpenCode HTTP requests run through curl, including in the tests; the
+  # 2.3.1 adoption test runs the Linux installer, which needs flock.
+  nativeCheckInputs = [
+    curl
+    util-linux
+  ];
 
   dontUseCmakeConfigure = true;
   env = buildEnv;
@@ -169,6 +189,9 @@ rustPlatform.buildRustPackage (finalAttrs: {
     homepage = "https://anoma.ly/hex/";
     license = lib.licenses.mit;
     mainProgram = "hex";
-    platforms = [ "x86_64-linux" ];
+    platforms = [
+      "x86_64-linux"
+      "aarch64-linux"
+    ];
   };
 })

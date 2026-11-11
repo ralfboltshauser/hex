@@ -123,10 +123,12 @@ pub(crate) struct Receipt {
     bytes: u64,
     pub(crate) sha256: String,
     modified_ns: u64,
-    /// The file's identity on its volume (`found_models::file_id`), where
-    /// the OS reports one.
+    /// The file's inode (`found_models::inode`), where the OS reports one.
+    /// Older receipts saved a `file_id` that mixed in the volume's device
+    /// number, which macOS can renumber at a restart; it is ignored, so
+    /// those receipts hold on size and modification time alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    file_id: Option<u64>,
+    inode: Option<u64>,
 }
 
 impl Receipt {
@@ -137,7 +139,7 @@ impl Receipt {
             sha256,
             modified_ns: super::models::modified_ns(&metadata)
                 .ok_or_else(|| eyre!("the file's modification time is unavailable"))?,
-            file_id: super::found_models::file_id(&metadata),
+            inode: super::found_models::inode(&metadata),
         })
     }
 
@@ -145,7 +147,7 @@ impl Receipt {
     pub(crate) fn holds(&self, metadata: &fs::Metadata) -> bool {
         self.bytes == metadata.len()
             && super::models::modified_ns(metadata) == Some(self.modified_ns)
-            && (self.file_id.is_none() || self.file_id == super::found_models::file_id(metadata))
+            && (self.inode.is_none() || self.inode == super::found_models::inode(metadata))
     }
 }
 
@@ -170,6 +172,9 @@ pub struct Imported {
     pub license: Option<String>,
     /// A found file used where it is: `owner/name@abcdef1`.
     pub origin: Option<String>,
+    /// Used where it is (a found file, or one added in place), never
+    /// copied: removing it only forgets it.
+    pub in_place: bool,
 }
 
 struct Entry {
@@ -184,9 +189,10 @@ struct Registry {
     /// The folder and modification time the entries were read at.
     stamp: Option<(PathBuf, Option<SystemTime>)>,
     entries: Vec<Entry>,
-    /// Definitions built so far, by ID and name: a rename or re-import
-    /// builds one, and every other read reuses it.
-    built: HashMap<(CustomModelId, String), &'static ModelDefinition>,
+    /// Definitions built so far, by ID, name, and the file it uses: a
+    /// rename, an in-place change, or a re-import builds one, and every
+    /// other read reuses it.
+    built: HashMap<(CustomModelId, String, Option<PathBuf>), &'static ModelDefinition>,
     placeholders: HashMap<CustomModelId, &'static ModelDefinition>,
 }
 
@@ -245,7 +251,7 @@ impl Registry {
                 };
                 let definition = *self
                     .built
-                    .entry((id, manifest.name.clone()))
+                    .entry((id, manifest.name.clone(), manifest.path.clone()))
                     .or_insert_with(|| build(id, &manifest));
                 let receipt = fs::read(receipt_path(&model_file(&directory, id)))
                     .ok()
@@ -337,7 +343,10 @@ fn build(id: CustomModelId, manifest: &Manifest) -> &'static ModelDefinition {
         runtime: ModelRuntime::Gguf(artifact),
         languages,
         accepts_language_hint: takes_language_hint(architecture),
-        supports_language_detection: manifest.detects_language && takes_language_hint(architecture),
+        // The header's lang_detect decides Auto. A no-hint family (Parakeet,
+        // GigaAM) hears the language itself without a hint, the way the
+        // catalog's v3-type entries do.
+        supports_language_detection: manifest.detects_language,
     }))
 }
 
@@ -424,6 +433,7 @@ pub fn imported() -> Vec<Imported> {
             source: entry.manifest.source.clone(),
             license: entry.manifest.license.clone(),
             origin: entry.manifest.origin.clone(),
+            in_place: entry.manifest.path.is_some(),
         })
         .collect()
 }
@@ -498,8 +508,10 @@ fn profile(header: &GgufHeader, file_name: &str) -> Result<Profile> {
     };
     if !ARCHITECTURES.iter().any(|(name, _)| *name == architecture) {
         bail!(
-            "its architecture is {architecture}; Hex runs Parakeet, Whisper, Qwen3-ASR, \
-             Cohere Transcribe, SenseVoice, and GigaAM models"
+            "its architecture is {architecture}, so it was made for another program. Hex runs \
+             only GGUF files converted with transcribe.cpp (Parakeet, Whisper, Qwen3-ASR, \
+             Cohere Transcribe, SenseVoice, or GigaAM); for a model in Hex's list, download \
+             it from the list instead"
         );
     }
     let Some(variant) = header.string("stt.variant") else {
@@ -790,6 +802,26 @@ pub fn adopt_in_place(
     origin: &str,
     canceled: &AtomicBool,
 ) -> Result<CustomModelId> {
+    record_in_place(path, blob_sha256, Some(origin), canceled)
+}
+
+/// Labs › Use model files where they are: adds a file the person chose
+/// and uses it where it is, as a found file is, so several accounts can
+/// share one file. Its header is checked, it is hashed in full once, and
+/// only Hex's receipt and record are written, in Hex's own folder. An
+/// earlier import of the same file by copy keeps its name, and Hex's copy
+/// goes once the OS shows the chosen file is a different one; choosing
+/// Hex's copy itself changes nothing. Forgetting it later leaves the file.
+pub fn add_in_place(path: &Path, canceled: &AtomicBool) -> Result<CustomModelId> {
+    record_in_place(path, None, None, canceled)
+}
+
+fn record_in_place(
+    path: &Path,
+    blob_sha256: Option<&str>,
+    origin: Option<&str>,
+    canceled: &AtomicBool,
+) -> Result<CustomModelId> {
     let header = gguf_header::read(path)
         .map_err(|error| eyre!("{} can't be used: {error}", display_name(path)))?;
     let profile = profile(&header, &file_stem(path))
@@ -804,6 +836,22 @@ pub fn adopt_in_place(
     let id = CustomModelId::from_sha256(&sha256);
     let directory = directory()?;
     fs::create_dir_all(&directory)?;
+    let existing = fs::read(manifest_file(&directory, id))
+        .ok()
+        .and_then(|data| serde_json::from_slice::<Manifest>(&data).ok())
+        .filter(|manifest| manifest.sha256 == sha256);
+    let copy = model_file(&directory, id);
+    // Hex's own copy reached through another spelling (a linked folder, a
+    // case-insensitive name, a hard link) is already imported: using it "in
+    // place" would delete the file it names.
+    if existing
+        .as_ref()
+        .is_some_and(|existing| existing.path.is_none())
+        && names_same_file(path, &copy)
+    {
+        tracing::info!(id = id.as_str(), path = %path.display(), "the file chosen to use in place is Hex's own copy; keeping the import as it is");
+        return Ok(id);
+    }
     super::models::write_json_atomically(
         &receipt_path(&model_file(&directory, id)),
         &Receipt::of(path, sha256.clone())?,
@@ -812,7 +860,9 @@ pub fn adopt_in_place(
         &directory,
         id,
         &Manifest {
-            name: profile.name.clone(),
+            name: existing
+                .as_ref()
+                .map_or_else(|| profile.name.clone(), |existing| existing.name.clone()),
             metadata_name: profile.name,
             architecture: profile.architecture,
             variant: profile.variant,
@@ -827,11 +877,38 @@ pub fn adopt_in_place(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs()),
             path: Some(path.to_path_buf()),
-            origin: Some(origin.to_owned()),
+            origin: origin.map(str::to_owned),
         },
     )?;
-    tracing::info!(id = id.as_str(), path = %path.display(), "using a speech model found on this computer");
+    // The same file imported by copy before: the file in place replaces
+    // Hex's copy, but only once the OS shows they are two files. When it
+    // can't tell, the copy stays.
+    if existing.is_some_and(|existing| existing.path.is_none()) && independent(path, &copy) {
+        match fs::remove_file(&copy) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(%error, id = id.as_str(), "could not remove Hex's copy of a model now used in place");
+            }
+            _ => {}
+        }
+    }
+    tracing::info!(id = id.as_str(), path = %path.display(), found = origin.is_some(), "using a speech model file where it is");
     Ok(id)
+}
+
+/// Whether two paths name the same file, after resolving links: the same
+/// resolved path, or the same file to the OS (device and inode, or volume
+/// and file index on Windows).
+fn names_same_file(left: &Path, right: &Path) -> bool {
+    matches!(
+        (fs::canonicalize(left), fs::canonicalize(right)),
+        (Ok(left), Ok(right)) if left == right
+    ) || matches!(same_file::is_same_file(left, right), Ok(true))
+}
+
+/// Whether two paths are positively two different files: both resolve and
+/// the OS reports different identities. Anything unreadable is not proof.
+fn independent(left: &Path, right: &Path) -> bool {
+    matches!(same_file::is_same_file(left, right), Ok(false))
 }
 
 /// Renames an import; only the picker's name changes.
@@ -986,6 +1063,175 @@ mod tests {
     }
 
     #[test]
+    fn a_file_added_in_place_is_recorded_by_path_copied_nowhere_and_forgetting_leaves_it() {
+        let models = temporary_models_dir();
+        let source = models.join("shared-primeline.gguf");
+        fs::write(&source, parakeet("Shared primeLine")).unwrap();
+        // An earlier import by copy keeps its name, and its copy goes.
+        let id = import(&source, Some("Mine"), &AtomicBool::new(false)).unwrap();
+        let copy = model_file(&directory().unwrap(), id);
+        assert!(copy.is_file());
+        assert_eq!(add_in_place(&source, &AtomicBool::new(false)).unwrap(), id);
+        assert!(!copy.exists(), "nothing is copied");
+        assert_eq!(status(id), Status::Ready);
+        let model = definition(id);
+        assert_eq!(model.name, "Mine");
+        assert_eq!(super::super::models::model_path(model).unwrap(), source);
+        let added = imported()
+            .into_iter()
+            .find(|import| import.definition.id == TranscriptionModelId::Custom(id))
+            .unwrap();
+        assert!(added.in_place && added.origin.is_none());
+        assert_eq!(added.source, "shared-primeline.gguf");
+        remove(id).unwrap();
+        assert!(!is_registered(id));
+        assert!(source.is_file(), "forgetting leaves the file");
+        super::super::models::set_test_models_dir(None);
+        fs::remove_dir_all(models).unwrap();
+    }
+
+    /// Hex's own copy chosen through a linked folder, a hard link, or
+    /// (on a case-insensitive volume) another case is that copy: using it
+    /// in place keeps the import as it is and never deletes the file.
+    #[cfg(unix)]
+    #[test]
+    fn hex_s_own_copy_chosen_through_another_path_is_never_deleted() {
+        let models = temporary_models_dir();
+        let source = models.join("primeline.gguf");
+        fs::write(&source, parakeet("Parakeet primeLine")).unwrap();
+        let id = import(&source, Some("Mine"), &AtomicBool::new(false)).unwrap();
+        let directory = directory().unwrap();
+        let copy = model_file(&directory, id);
+        let file_name = copy.file_name().unwrap();
+        let linked = models.join("linked");
+        std::os::unix::fs::symlink(&directory, &linked).unwrap();
+        let hard = models.join("hard.gguf");
+        fs::hard_link(&copy, &hard).unwrap();
+        let mut chosen = vec![linked.join(file_name), hard];
+        let other_case = models
+            .join(
+                directory
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_uppercase(),
+            )
+            .join(file_name);
+        if other_case.is_file() {
+            chosen.push(other_case);
+        }
+        for path in chosen {
+            assert_eq!(add_in_place(&path, &AtomicBool::new(false)).unwrap(), id);
+            assert!(copy.is_file(), "{} deleted Hex's copy", path.display());
+            invalidate();
+            assert_eq!(status(id), Status::Ready);
+            let model = definition(id);
+            assert_eq!(super::super::models::model_path(model).unwrap(), copy);
+            assert_eq!(model.name, "Mine");
+        }
+        super::super::models::set_test_models_dir(None);
+        fs::remove_dir_all(models).unwrap();
+    }
+
+    /// A separate file with the same bytes, here reached through a linked
+    /// folder, is a different file: it replaces Hex's copy.
+    #[cfg(unix)]
+    #[test]
+    fn an_independent_identical_file_replaces_hex_s_copy() {
+        let models = temporary_models_dir();
+        let bytes = parakeet("Parakeet primeLine");
+        let original = models.join("primeline.gguf");
+        fs::write(&original, &bytes).unwrap();
+        let id = import(&original, None, &AtomicBool::new(false)).unwrap();
+        let copy = model_file(&directory().unwrap(), id);
+        let shared = models.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("primeline.gguf"), &bytes).unwrap();
+        let linked = models.join("linked-shared");
+        std::os::unix::fs::symlink(&shared, &linked).unwrap();
+        let chosen = linked.join("primeline.gguf");
+        assert_eq!(add_in_place(&chosen, &AtomicBool::new(false)).unwrap(), id);
+        assert!(!copy.exists(), "the independent file replaces Hex's copy");
+        assert!(original.is_file() && shared.join("primeline.gguf").is_file());
+        invalidate();
+        assert_eq!(status(id), Status::Ready);
+        assert_eq!(
+            super::super::models::model_path(definition(id)).unwrap(),
+            chosen
+        );
+        super::super::models::set_test_models_dir(None);
+        fs::remove_dir_all(models).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relinked_copy_reads_as_changed_and_check_again_accepts_only_the_same_contents() {
+        let models = temporary_models_dir();
+        let shared = models.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let source = shared.join("primeline.gguf");
+        fs::write(&source, parakeet("Shared primeLine")).unwrap();
+        let id = import(&source, None, &AtomicBool::new(false)).unwrap();
+        assert_eq!(status(id), Status::Ready);
+        let copy = model_file(&directory().unwrap(), id);
+        // Hex's copy swapped for a link to the identical shared file.
+        fs::remove_file(&copy).unwrap();
+        std::os::unix::fs::symlink(&source, &copy).unwrap();
+        invalidate();
+        assert_eq!(status(id), Status::Changed);
+        repair(id, &AtomicBool::new(false)).unwrap();
+        assert_eq!(status(id), Status::Ready);
+        // A link to other contents stays changed.
+        let other = shared.join("other.gguf");
+        fs::write(&other, parakeet("Another primeLine model")).unwrap();
+        fs::remove_file(&copy).unwrap();
+        std::os::unix::fs::symlink(&other, &copy).unwrap();
+        invalidate();
+        assert_eq!(status(id), Status::Changed);
+        assert!(
+            repair(id, &AtomicBool::new(false))
+                .unwrap_err()
+                .to_string()
+                .contains("no longer matches")
+        );
+        assert_eq!(status(id), Status::Changed);
+        super::super::models::set_test_models_dir(None);
+        fs::remove_dir_all(models).unwrap();
+    }
+
+    #[test]
+    fn a_receipt_survives_a_renumbered_volume_but_not_another_file() {
+        let models = temporary_models_dir();
+        let file = models.join("model.gguf");
+        fs::write(&file, b"weights").unwrap();
+        let metadata = fs::metadata(&file).unwrap();
+        let receipt = Receipt::of(&file, "ab".repeat(32)).unwrap();
+        assert!(receipt.holds(&metadata));
+        // An older receipt's `file_id` mixed in the volume's device number,
+        // which macOS renumbers at a restart; size and time still prove it.
+        let modified_ns = super::super::models::modified_ns(&metadata).unwrap();
+        let legacy = format!(
+            r#"{{"bytes":{},"sha256":"","modified_ns":{modified_ns},"file_id":12345}}"#,
+            metadata.len()
+        );
+        assert!(
+            serde_json::from_str::<Receipt>(&legacy)
+                .unwrap()
+                .holds(&metadata)
+        );
+        #[cfg(unix)]
+        {
+            let other = Receipt {
+                inode: receipt.inode.map(|inode| inode ^ 1),
+                ..receipt
+            };
+            assert!(!other.holds(&metadata));
+        }
+        super::super::models::set_test_models_dir(None);
+        fs::remove_dir_all(models).unwrap();
+    }
+
+    #[test]
     fn a_refused_or_canceled_import_leaves_nothing_behind() {
         let models = temporary_models_dir();
         let source = models.join("llama.gguf");
@@ -1088,9 +1334,25 @@ mod tests {
         };
         let definition = build(CustomModelId::from_sha256(&manifest.sha256), &manifest);
         assert!(!definition.accepts_language_hint);
-        assert!(!definition.supports_language_detection);
+        assert!(
+            definition.supports_language_detection,
+            "a no-hint import whose header detects the language offers Auto"
+        );
         assert!(takes_language_hint("whisper"));
         assert!(!takes_language_hint("parakeet"));
+        // A hint-taking family still needs the header's detection.
+        let whisper = build(
+            CustomModelId::from_sha256(&manifest.sha256),
+            &Manifest {
+                architecture: "whisper".into(),
+                variant: "whisper-large-v3-turbo".into(),
+                languages: vec!["en".into()],
+                detects_language: false,
+                ..manifest
+            },
+        );
+        assert!(whisper.accepts_language_hint);
+        assert!(!whisper.supports_language_detection);
     }
 
     #[test]
@@ -1109,6 +1371,16 @@ mod tests {
             ))
             .contains("its architecture is llama")
         );
+        // A SenseVoice file made for another program names that, not a
+        // family Hex says it runs (#1299).
+        let other_runtime = reason(gguf(
+            &[("general.architecture", "sensevoice-small")],
+            &[],
+            &[],
+            &[("a", 0, 4)],
+        ));
+        assert!(other_runtime.contains("made for another program"));
+        assert!(other_runtime.contains("converted with transcribe.cpp"));
         assert!(reason(gguf(&[], &[], &[], &[("a", 0, 4)])).contains("no general.architecture"));
         assert!(
             reason(gguf(
