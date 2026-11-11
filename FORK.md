@@ -76,6 +76,44 @@ merge unfinished feature branches. Report specific failures and leave the workin
 installation alone. The T3 schedule needs this Mac awake and T3 running; the manual
 command remains available after missed runs. Use `status` to inspect saved state.
 
+### Daily upstream review
+
+Every daily run reviews upstream activity before its no-update/quiet exit, even
+when `prepare` says personal already contains the latest stable. Use GitHub's
+official release API, commit comparisons, and pinned source; release notes are
+claims to check, not proof of runtime behavior.
+
+1. Resolve the latest published stable tag to its commit and publication time.
+   Pin upstream `production` and `dev` heads too. Compare stable with the upstream
+   baseline in personal, and dev with stable; follow pagination so commits are not
+   silently omitted. Keep unreleased changes distinct from the stable candidate.
+2. Review stable release notes and changed code for dictation/audio recovery,
+   shortcut and cancellation semantics, transcription/models, History/audio
+   retention, meeting processing/privacy, settings migrations, HUD/UI, and Labs
+   defaults/prerequisites. Check the actual paths and feature documentation for
+   material claims and limitations, including Secure Input. Review every personal
+   customization and moved integration point even when the merge is clean.
+3. Inspect post-release commits for relevant fixes or regressions affecting this
+   Mac or our fork. In particular, look for follow-ups to fixes advertised in the
+   stable release, such as repeated microphone-stall recovery. Record source
+   evidence and affected versions; keep the build target on published stable.
+4. Save the dated findings, pinned inputs, source links, behavior/migration
+   changes, customization impact, and manual test gaps in canonical
+   `.hex-fork/daily-result.md`. Preserve the previous result until comparison is
+   complete. Distinguish publisher claims, inspected implementation, passing
+   checks, and observed native behavior. A failed upstream lookup is an
+   incomplete review, not evidence that nothing changed.
+5. Report a newly ready stable candidate, a changed actionable blocker, or a new
+   material upstream finding (including unreleased fixes and source caveats).
+   Compare findings by affected behavior and pinned commit, not report date;
+   unchanged findings stay quiet. A stable release first published after the
+   previous run belongs to the next run. The Mac must be awake and T3 running.
+
+Perform this review in the daily agent itself, without delegates or paid provider
+turns. It authorizes no app/device testing, live-data changes, publication,
+installation, schedule changes, or merging of unfinished features. Ambiguous
+replacement/removal of personal behavior still requires Ralf's decision.
+
 Installation targets only `~/Applications/Hex Ralf.app`, requires it to be closed,
 and retains any previous bundle alongside it. It does not launch either app,
 change permissions, install the microphone driver, or copy official Hex data.
