@@ -35,6 +35,7 @@ fn recovery_shows_saved_text_and_names_its_controls() {
 #[cfg(target_os = "linux")]
 #[test]
 fn recovery_dark_and_light_goldens() {
+    let _goldens = Goldens::collect();
     check_golden("history-recovery", true, PANE_SIZE);
     check_golden("history-recovery", false, PANE_SIZE);
 }

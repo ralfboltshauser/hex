@@ -474,3 +474,33 @@ fn newer_formats_remain_visible_and_untouched_until_explicit_deletion() {
     assert!(client.list().unwrap().is_empty());
     client.shutdown().unwrap();
 }
+
+#[test]
+fn a_processing_failure_stays_unresolved_after_successful_fallback_delivery() {
+    let root = Root::new();
+    let client = Client::start(root.0.clone()).unwrap();
+    let session = client.begin(Default::default()).unwrap();
+    ready(&session);
+    session.offer(0, &[0.25; 100]).unwrap();
+    session.seal(100).unwrap();
+    session.save_raw("original synthetic transcript").unwrap();
+    session.preserve_failure(Failure::Processing).unwrap();
+    session
+        .prepare_delivery("fallback synthetic transcript")
+        .unwrap();
+    session.outcome(Delivery::ReportedSuccess).unwrap();
+    let id = session.id().clone();
+    client.shutdown().unwrap();
+    let client = Client::start(root.0.clone()).unwrap();
+    let entries = client.list().unwrap();
+    let snapshot = entries[0].snapshot.as_ref().unwrap();
+    assert_eq!(snapshot.error, Some(Failure::Processing));
+    assert_eq!(snapshot.delivery, Delivery::ReportedSuccess);
+    assert!(snapshot.resolved_ms.is_none());
+    assert_eq!(
+        client.text(id.clone(), true).unwrap(),
+        "original synthetic transcript"
+    );
+    assert!(client.reader(id).unwrap().next().unwrap().is_some());
+    client.shutdown().unwrap();
+}

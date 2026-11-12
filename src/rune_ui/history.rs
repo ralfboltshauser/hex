@@ -805,6 +805,16 @@ fn kept_label(retention: HistoryRetention) -> String {
 /// where that lab shows, and Clear all history… last. Once Clear all is
 /// chosen, the menu gives way to its confirmation until it is answered.
 fn header_actions(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Vec<El> {
+    if ui.history.mutation.is_some() {
+        return vec![crate::rune_ui::controls::button_disabled(
+            p,
+            "history-deleting",
+            tr("Deleting…"),
+            ButtonKind::Secondary,
+            true,
+            |_: &mut Ui, _| {},
+        )];
+    }
     if ui.history.clear_armed {
         return vec![
             button(

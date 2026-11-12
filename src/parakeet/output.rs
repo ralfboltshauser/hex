@@ -26,6 +26,14 @@ pub(super) fn finish_output(
                 }
                 let paste_started = Instant::now();
                 if let Some(session) = &control.recovery {
+                    let failure = if matches!(target, TranscriptionTarget::CopyOnlyPaste | TranscriptionTarget::RawCopyOnlyPaste) {
+                        Some(crate::recovery::Failure::Interrupted)
+                    } else if completed.processing.as_ref().is_some_and(|processing| processing.fallback.is_some()) {
+                        Some(crate::recovery::Failure::Processing)
+                    } else { None };
+                    if let Some(failure) = failure {
+                        session.preserve_failure(failure).map_err(|_| "The local safety copy could not preserve the interruption. Nothing was delivered.".to_string())?;
+                    }
                     session.prepare_delivery(&completed.text).map_err(|_| "The local safety copy could not save the final transcript. Nothing was delivered.".to_string())?;
                 }
                 if !completed.text.trim().is_empty() {
@@ -80,11 +88,13 @@ pub(super) fn finish_output(
                             .ok_or_else(|| eyre!("dictation was cancelled")),
                     }
                     .map_err(|error| error.to_string());
-                    if let Some(session) = &control.recovery
-                        && !control.is_cancelled()
-                            && let Some(history) = history {
-                                record_history(history, target, &mut completed, Some(session.id().as_str().to_owned()), Some(delivery.is_ok()));
-                            }
+                    if let Some(session) = &control.recovery && !control.is_cancelled() {
+                        if let Some(history) = history {
+                            record_history(history, target, &mut completed, Some(session), Some(delivery.is_ok()));
+                        } else if completed.recording.is_some() && session.preserve_failure(crate::recovery::Failure::Storage).is_err() {
+                            tracing::warn!("could not preserve unavailable retained-audio handoff");
+                        }
+                    }
                     delivery?;
                     if matches!(
                         target,
@@ -176,7 +186,7 @@ fn record_history(
     history: &History,
     target: TranscriptionTarget,
     completed: &mut CompletedTranscript,
-    recovery_id: Option<String>,
+    recovery: Option<&crate::recovery::Session>,
     delivered: Option<bool>,
 ) {
     let kind = match target {
@@ -185,6 +195,7 @@ fn record_history(
         TranscriptionTarget::Print | TranscriptionTarget::RawPrint => HistoryKind::Printed,
         TranscriptionTarget::Service => return,
     };
+    let wanted_audio = completed.recording.is_some();
     let draft = HistoryDraft {
         kind,
         raw_text: completed.raw.clone(),
@@ -197,8 +208,26 @@ fn record_history(
         recording: completed.recording.take(),
         model: crate::history::dictation_model(),
     };
-    if let Err(error) = history.record_correlated(draft, recovery_id, delivered) {
-        tracing::warn!(%error, "could not record dictation history");
+    let result = history.record_correlated(
+        draft,
+        recovery.map(|session| session.id().as_str().to_owned()),
+        delivered,
+    );
+    let failed = match result {
+        Ok(Some(id)) => wanted_audio && history.recording_path(id).is_none(),
+        Ok(None) => false, // History retention is intentionally off.
+        Err(error) => {
+            tracing::warn!(%error, "could not record dictation history");
+            true
+        }
+    };
+    if failed
+        && let Some(session) = recovery
+        && session
+            .preserve_failure(crate::recovery::Failure::Storage)
+            .is_err()
+    {
+        tracing::warn!("could not preserve failed History handoff");
     }
 }
 
@@ -301,5 +330,66 @@ mod tests {
         ));
         client.shutdown().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn failed_retained_wav_handoff_preserves_the_source_after_delivery() {
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("hex-output-handoff-{nonce}"));
+        let client = Client::start(base.join("recovery")).unwrap();
+        let session = client.begin(Default::default()).unwrap();
+        assert_eq!(client.list().unwrap().len(), 1);
+        session.offer(0, &[0.25; 100]).unwrap();
+        session.seal(100).unwrap();
+        session.save_raw("synthetic raw result").unwrap();
+        let history = History::new(crate::history::HistoryStore::open(
+            base.join("history.json"),
+            crate::history::HistoryRetention::Week,
+            crate::history::now_ms(),
+        ));
+        std::fs::write(base.join("history-audio"), b"blocked directory").unwrap();
+        let mut output = job(session.clone());
+        if let OutputJob::Completed { result, .. } = &mut output {
+            result.as_mut().as_mut().unwrap().recording = Some(
+                crate::history::recordings::Recording::from_samples(vec![0.25; 100]),
+            );
+        }
+        let result = finish_output(
+            output,
+            &mut |_, _, commit| {
+                assert!(commit());
+                Ok(())
+            },
+            &mut None,
+            Some(&history),
+        );
+        assert!(matches!(
+            result,
+            WorkerEvent::Completed { result: Ok(_), .. }
+        ));
+        let entries = client.list().unwrap();
+        let snapshot = entries[0].snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.delivery, Delivery::ReportedSuccess);
+        assert_eq!(snapshot.error, Some(crate::recovery::Failure::Storage));
+        assert!(snapshot.resolved_ms.is_none());
+        assert_eq!(
+            client.text(session.id().clone(), true).unwrap(),
+            "synthetic raw result"
+        );
+        assert!(
+            client
+                .reader(session.id().clone())
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_some()
+        );
+        drop(history);
+        client.shutdown().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -758,6 +758,7 @@ impl History {
     pub fn record(&self, draft: HistoryDraft) -> io::Result<Option<u64>> {
         self.synced().record(draft, now_ms())
     }
+    #[cfg(target_os = "macos")]
     pub fn record_correlated(
         &self,
         draft: HistoryDraft,

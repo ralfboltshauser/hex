@@ -4,7 +4,10 @@ The personal macOS build has a default-off **Recording recovery** lab. It adds
 local safety copies for intentional shortcut dictations. Programmatic captures,
 idle microphone audio and tentative shortcut presses are excluded. Turning the
 lab off prevents new copies; existing recovery actions remain available in
-History → Recovery. History retention can be off independently.
+History → Recovery. History retention can be off independently. With Keep recordings enabled, the
+retained History WAV streams from the durable source, without another whole-clip
+audio copy. Failed History/audio handoff or processing fallback leaves that
+source unresolved even when native delivery succeeds.
 
 A saved result never means the receiving application accepted it. A delivery
 intent is durable before native output begins. A process interruption during

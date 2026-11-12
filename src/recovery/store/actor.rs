@@ -89,6 +89,19 @@ impl Store {
                     .map_err(|error| classify(&error));
                 let _ = reply.send(result);
             }
+            Command::Failure { id, failure, reply } => {
+                let result = (|| {
+                    let session = self.sessions.get_mut(&id).ok_or(Failure::Storage)?;
+                    if session.blocked {
+                        return Err(Failure::Storage);
+                    }
+                    let manifest = session.manifest.as_mut().ok_or(Failure::Storage)?;
+                    manifest.snapshot.error = Some(failure);
+                    manifest.snapshot.resolved_ms = None;
+                    self.persist(&id).map_err(|error| classify(&error))
+                })();
+                let _ = reply.send(result);
+            }
             Command::Outcome {
                 id,
                 delivery,

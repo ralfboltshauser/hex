@@ -27,6 +27,7 @@ pub(super) struct RecoveryPane {
 }
 #[derive(Clone)]
 enum Kind {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     List(u64),
     Text(String, bool),
     Action,

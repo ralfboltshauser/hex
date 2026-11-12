@@ -66,6 +66,11 @@ pub(super) enum Command {
         intent: bool,
         reply: Reply<()>,
     },
+    Failure {
+        id: SessionId,
+        failure: Failure,
+        reply: Reply<()>,
+    },
     Outcome {
         id: SessionId,
         delivery: Delivery,
@@ -123,7 +128,8 @@ impl Client {
                         store.watch(revision);
                         store.run(receiver);
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::warn!(%error, "recording recovery store initialization failed");
                         // Keep replying deterministically instead of leaving admitted
                         // callers waiting on a worker which failed setup.
                         while let Ok(command) = receiver.recv() {
@@ -146,7 +152,10 @@ impl Client {
         self.0
             .commands
             .try_send(command)
-            .map_err(|_| Failure::Overflow)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => Failure::Overflow,
+                mpsc::TrySendError::Disconnected(_) => Failure::Storage,
+            })
     }
     fn call<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T, Failure> {
         let (send, receive) = mpsc::sync_channel(1);
@@ -227,6 +236,10 @@ impl Client {
 impl Session {
     fn elapsed(&self) -> u64 {
         self.health.started.elapsed().as_millis() as u64 + 1
+    }
+    /// A bounded, pinned source for the retained History WAV.
+    pub(crate) fn reader(&self) -> Result<AudioReader, Failure> {
+        self.client.reader(self.id.clone())
     }
     pub fn id(&self) -> &SessionId {
         &self.id
@@ -325,6 +338,15 @@ impl Session {
             reply,
         })
     }
+    /// Keep incomplete processing or product-storage work unresolved even
+    /// when the native delivery itself succeeded.
+    pub fn preserve_failure(&self, failure: Failure) -> Result<(), Failure> {
+        self.client.call(|reply| Command::Failure {
+            id: self.id.clone(),
+            failure,
+            reply,
+        })
+    }
     pub fn outcome(&self, delivery: Delivery) -> Result<(), Failure> {
         self.client.call(|reply| Command::Outcome {
             id: self.id.clone(),
@@ -371,6 +393,7 @@ impl Command {
             }
             Self::Text { reply, .. }
             | Self::Outcome { reply, .. }
+            | Self::Failure { reply, .. }
             | Self::Resolve { reply, .. }
             | Self::Delete { reply, .. }
             | Self::ReplayFinish { reply, .. }

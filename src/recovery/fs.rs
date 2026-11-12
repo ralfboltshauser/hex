@@ -273,10 +273,4 @@ impl Directory {
     }
 }
 
-pub(super) fn full_sync(file: &File) -> io::Result<()> {
-    // SAFETY: macOS F_FULLFSYNC takes a live fd; the third argument is ignored.
-    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
+pub(super) use crate::durable::full_sync;

@@ -285,3 +285,21 @@ maintenance/signature-regression Python tests also passed. Linux interaction
 checks/goldens and clean-commit packaging remain pending because the configured
 1Password Git signing agent rejected commit creation. No unsigned commit or
 release artifact was substituted.
+
+
+Git signing was restored through the configured 1Password agent. Commit
+`ede306dfc2c2fa0020ea0acdfd64c6f949e41f94` passed clean-commit personal
+verification and Developer ID bundle validation; no install or publication took
+place. Linux/Nix packaging checks passed on that revision. Linux ran 2,171 tests:
+2,170 passed and the new Recovery golden was missing, as expected before reference
+images were collected. The generated dark image was inspected.
+
+The subsequent History handoff cleanup streams the retained WAV from a pinned
+recovery reader. It shares the strict macOS device barrier and preserves failed
+History/WAV handoff, rescued capture and processing fallback as unresolved work.
+Regression checks cover failed retained-WAV publication despite successful native
+output, failure persistence across restart, and a streamed multi-segment WAV that
+survives source deletion. The frozen native check passed **2,710 tests**, 36
+excluded/ignored, with strict clippy, formatting, code-shape and Nix pins.
+Final Linux reference images/checks and optimized workload verification remain
+pending; the earlier signing rejection is resolved.

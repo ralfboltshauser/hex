@@ -454,7 +454,10 @@ impl DictationWorker {
         crate::dictation::diagnostics::persist(&samples);
         let recording = match target {
             TranscriptionTarget::Service => None,
-            _ => crate::history::Recording::keep(&samples),
+            _ => match &control.recovery {
+                Some(session) => crate::history::Recording::keep_recovery(session),
+                None => crate::history::Recording::keep(&samples),
+            },
         };
         let prepare_ms = submitted_at.elapsed().as_millis();
         let offline = {

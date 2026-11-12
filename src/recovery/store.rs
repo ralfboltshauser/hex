@@ -390,7 +390,9 @@ impl Store {
                 .min(FRAME_SAMPLES)
                 .min((SEGMENT_SAMPLES - written % SEGMENT_SAMPLES) as usize);
             let chunk = &remaining[..take];
-            self.charge(id, chunk.len() as u64 * 4 + 4096)?;
+            let charge = chunk.len() as u64 * 4 + 4096;
+            self.ensure(charge + RESERVE)?;
+            self.charge(id, charge)?;
             let session = self.sessions.get_mut(id).unwrap();
             let segment = session.written / SEGMENT_SAMPLES;
             if session
