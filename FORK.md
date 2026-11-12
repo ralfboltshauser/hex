@@ -7,9 +7,16 @@ upstream's `dev` and `production` branches free of personal commits.
 
 ## Feature work
 
+Use [hex-fork-feature](.agents/skills/hex-fork-feature/SKILL.md) for personal
+implementation and [hex-fork-release](.agents/skills/hex-fork-release/SKILL.md)
+for explicit releases and cleanup. Release reports in canonical
+`.hex-fork/releases/` retain included source heads, verification and delivery
+evidence, and cleanup outcomes. Retire only published, unchanged, inactive source
+work; preserve builds and backups, and report every deferred workspace or branch.
+
 Fetch `origin personal`, inspect existing work, and start independent features in
-sibling worktrees from that fetched revision. Side chats share their parent's
-feature. Use ordinary commits and merges. Preserve unfinished work; feature
+sibling worktrees from that fetched revision. Work on the same feature shares
+its existing worktree. Use ordinary commits and merges. Preserve unfinished work; feature
 completion does not install an application. Look for existing config/API seams
 before changing the source, and keep upstream-owned code recognizable.
 
@@ -28,7 +35,7 @@ names. Keep `anomaly.hex.test`, `hex-test://`, the
 `hex-test` data/config folders, and update isolation unchanged so existing settings
 and macOS permission identity survive. Verify with `bash scripts/personal/check.sh`
 and the packaged build validation. Fork maintenance also lives in this file, the
-personal routing paragraph in `AGENTS.md`, `t3.json`, `.gitignore`,
+personal routing paragraph in `AGENTS.md`, `.gitignore`,
 `rust-toolchain.toml`, and `scripts/personal/`. The checkout pins Rust 1.99.1 because the 3.3.0
 lockfile requires at least 1.97; keep toolchain changes separate from feature work.
 
@@ -85,8 +92,9 @@ and build. Never force-push personal or weaken assertions to make an update pass
 Daily maintenance prepares, reviews, checks and builds new stable updates. It
 leaves the candidate ready for explicit publication/installation; it does not
 merge unfinished feature branches. Report specific failures and leave the working
-installation alone. The T3 schedule needs this Mac awake and T3 running; the manual
-command remains available after missed runs. Use `status` to inspect saved state.
+installation alone. Scheduled maintenance needs this Mac awake and its scheduler
+running; the manual command remains available after missed runs. Use `status` to
+inspect saved state.
 
 ### Daily upstream review
 
@@ -119,7 +127,7 @@ claims to check, not proof of runtime behavior.
    material upstream finding (including unreleased fixes and source caveats).
    Compare findings by affected behavior and pinned commit, not report date;
    unchanged findings stay quiet. A stable release first published after the
-   previous run belongs to the next run. The Mac must be awake and T3 running.
+   previous run belongs to the next run. The Mac and scheduler must be running.
 
 Perform this review in the daily agent itself, without delegates or paid provider
 turns. It authorizes no app/device testing, live-data changes, publication,

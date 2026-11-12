@@ -11,6 +11,12 @@ replacement instructions do not apply to this fork. Keep the upstream technical
 guidance below. Before invoking Claude Code, follow the installed
 `claude-subscription-only` skill and its guarded subscription launcher.
 
+For personal feature implementation, read
+[hex-fork-feature](.agents/skills/hex-fork-feature/SKILL.md). For an explicit
+release, release status/resume, or branch/worktree cleanup, read
+[hex-fork-release](.agents/skills/hex-fork-release/SKILL.md). These workflows
+preserve the fork's explicit-install boundary and account for deferred cleanup.
+
 ## Private Kit Tool
 
 `dev` and `production` take changes only through pull requests (Dax's
