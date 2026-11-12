@@ -60,6 +60,18 @@ each other's designated requirements and rejects a different app identifier.
 
 ## Update and delivery
 
+GitHub Actions is disabled on `ralfboltshauser/hex`; this fork carries no
+`.github/workflows/` definitions. Run release verification on this local Mac
+through `maintain.py verify`, whose gate is
+`scripts/personal/release-check.sh`. It checks Metal availability, runs the full
+upstream local check and personal regressions, checks macOS app identity, builds
+the debug binary and scans it for compromised CA roots. Signed bundle validation
+remains part of `maintain.py build`. Linux/Windows native tests, Linux-only
+goldens and Nix package builds remain unverified by this macOS gate. Do not
+dispatch upstream CI for personal work. Remove workflows reintroduced by an
+upstream merge before verifying its candidate. Preserve `.github/release/`
+helpers used by upstream scripts; their presence does not enable automation.
+
 Run commands from the checkout being checked. State and artifacts are shared
 through the canonical checkout's ignored `.hex-fork/`, including across worktrees.
 
@@ -81,7 +93,7 @@ inspection. Reuse candidates and passing unchanged artifacts rather than startin
 again. If upstream overlaps a customization, compare actual semantics and ask
 about ambiguous replacement/removal; mechanical repair needs no extra approval.
 
-`verify` runs upstream's complete local check command and the personal checks,
+`verify` runs the complete local release gate described above,
 and records successful completion for a clean commit. Failed rechecks revoke
 earlier evidence. Nextest uses four concurrent tests to limit background load;
 the first unrestricted run hit a subprocess test's three-second assertion, which

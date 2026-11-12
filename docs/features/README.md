@@ -1730,6 +1730,17 @@ Software Update window; no installation was performed. That path remains the
 workaround for older versions, including after Remind Me Later. A repaired
 installed-sidebar click remains unverified.
 
+Personal Hex Ralf releases use the [local macOS gate](../../scripts/personal/release-check.sh)
+through [`maintain.py verify`](../../scripts/personal/maintain.py), as described in
+[FORK.md](../../FORK.md#update-and-delivery). GitHub Actions is disabled on the
+personal fork. The gate checks Metal availability, formatting, code shape, Nix
+pins, Clippy, Rust tests, personal regressions, macOS app identity and CA roots
+in a debug build. It requires the Metal toolchain and cargo-nextest on this Mac;
+a failure prevents a verification receipt and therefore the signed build.
+Linux/Windows native checks, Linux-only goldens and Nix package builds remain
+unverified by this gate. A passing receipt is not installed-app or physical
+dictation/paste proof.
+
 The [historical release verification](release-verification.md) records publication
 evidence through 2.1.20, including signing, artifact checks, CI results, and skipped
 native checks. Those release-specific results do not verify the current working

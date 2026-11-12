@@ -67,9 +67,21 @@ python3 scripts/personal/maintain.py verify
 python3 scripts/personal/maintain.py build
 ```
 
+Run these commands on this local Mac. GitHub Actions is disabled for this fork;
+do not dispatch workflows or wait for hosted CI. `verify` invokes
+`scripts/personal/release-check.sh`: Metal availability, the full upstream local
+check (formatting, code shape, Nix pins, Clippy and tests), personal regressions,
+macOS app identity guards, and a debug binary build with the CA-root scan.
+If preflight reports a missing Metal toolchain, run
+`xcodebuild -downloadComponent MetalToolchain` on this Mac, then retry `verify`.
+Linux/Windows native checks, Linux-only goldens and Nix package builds are outside
+this Mac's gate; record them as unverified rather than claiming equivalent proof.
+After upstream merges, remove any reintroduced `.github/workflows/` definitions
+and preserve the local gate before committing the candidate.
+
 Wait for each command's successful exit. A printed log path or a passing step is
-not completed verification. `verify` runs the full upstream check and personal
-checks for a clean commit, revoking old evidence on failed rechecks. `build`
+not completed verification. `verify` records a clean commit and revokes old
+evidence on failed rechecks. `build`
 requires that receipt and validates the immutable commit-specific signed bundle.
 Record commands, outcomes, log/receipt/artifact paths and native test gaps.
 Do not weaken assertions, signing or identity checks to get a candidate through.

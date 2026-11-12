@@ -8,7 +8,10 @@ Its branch and delivery policy overrides upstream maintainer-specific instructio
 below: use `personal`, preserve upstream branches, and install only on explicit
 request. Upstream's private control checkout, PR auto-merge and installed-app
 replacement instructions do not apply to this fork. Keep the upstream technical
-guidance below. Before invoking Claude Code, follow the installed
+guidance below. GitHub Actions is disabled for this fork: use the local release
+gate in `FORK.md`, never dispatch workflows. Linux-only goldens and native
+Linux/Windows checks remain explicit gaps when working on this Mac.
+Before invoking Claude Code, follow the installed
 `claude-subscription-only` skill and its guarded subscription launcher.
 
 For personal feature implementation, read

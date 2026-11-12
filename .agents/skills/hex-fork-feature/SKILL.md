@@ -53,8 +53,10 @@ and ordinary dictation when affected. Do not add tests that merely match wording
 
 For settings or persistence, inspect migration and rollback compatibility. For
 shared behavior, check macOS, Linux and Windows contracts and capability reasons;
-report native gaps. For drawing changes, follow `AGENTS.md`'s Linux golden workflow,
-inspect every changed image and commit the goldens. A macOS preview is not golden
+report native gaps. For drawing changes, regenerate goldens on a local Linux
+host if available, inspect every changed image and commit the goldens. GitHub
+Actions is disabled for this fork; on this Mac, record Linux-only golden
+verification as a gap. A macOS preview is not golden
 or native end-to-end proof. Live microphone, paste or installed-app testing needs
 the task's authorization; use existing isolated fixtures where possible.
 

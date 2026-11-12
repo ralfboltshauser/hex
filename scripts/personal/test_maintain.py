@@ -85,6 +85,7 @@ class WorkflowTests(unittest.TestCase):
     def test_failed_recheck_revokes_success_and_changed_source_cannot_build(self):
         script = self.repo / 'scripts'
         (script / 'personal').mkdir(parents=True)
+        (script / 'personal/release-check.sh').write_text('bash scripts/check && bash scripts/personal/check.sh\n')
         (script / 'check').write_text('exit 0\n')
         (script / 'personal/check.sh').write_text('test ! -e .hex-fork/fail\n')
         head = self.commit('checks')
