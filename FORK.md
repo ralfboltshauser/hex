@@ -11,8 +11,10 @@ Use [hex-fork-feature](.agents/skills/hex-fork-feature/SKILL.md) for personal
 implementation and [hex-fork-release](.agents/skills/hex-fork-release/SKILL.md)
 for explicit releases and cleanup. Release reports in canonical
 `.hex-fork/releases/` retain included source heads, verification and delivery
-evidence, and cleanup outcomes. Retire only published, unchanged, inactive source
-work; preserve builds and backups, and report every deferred workspace or branch.
+evidence, and cleanup outcomes. Every release audits older personal work and
+orphans as well as its included features. Retire only published, unchanged,
+inactive source work; preserve builds and backups, and report every deferred
+workspace or branch.
 
 Fetch `origin personal`, inspect existing work, and start independent features in
 sibling worktrees from that fetched revision. Work on the same feature shares

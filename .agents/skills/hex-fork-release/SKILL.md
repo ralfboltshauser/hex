@@ -1,6 +1,6 @@
 ---
 name: hex-fork-release
-description: Integrate ready personal Hex features, verify and build the signed Hex Ralf candidate, publish when requested, and resume release status or guarded branch/worktree cleanup. Install only on explicit request.
+description: Integrate ready personal Hex features, verify and build the signed Hex Ralf candidate, publish when requested, and resume release status or guarded cleanup of current and older personal work, including orphans. Install only on explicit request.
 ---
 
 # Release personal Hex
@@ -105,13 +105,15 @@ authorized valuable-data testing, follow the data backup rules in `FORK.md`.
 
 ## Cleanup is part of completion
 
-After verified publication, follow
-[the guarded cleanup procedure](references/cleanup.md). Perform every eligible
-source branch/worktree deletion within the release/cleanup request and record
-every deferral. Installation is independent: published commits and preserved
-build artifacts retain the source and rollback material after branches retire.
-Build-only work keeps its unpublished candidate. On a later status/cleanup
-request, revisit deferred items using current evidence.
+After verified publication, follow [the guarded cleanup
+procedure](references/cleanup.md). Every release and cleanup run inventories
+older personal branches, candidates and orphan workspaces too, even when the
+request names only the current feature. Investigate likely stale items, retire
+every source that meets the evidence gates, and record each deferral.
+Installation is independent: published commits and preserved build artifacts
+retain the source and rollback material after branches retire. Build-only work
+keeps its unpublished candidate. On a later status/cleanup request, revisit
+deferred items and discover newly orphaned work using current evidence.
 
 Finish with included behavior, upstream range/highlights if changed, checks/limits,
 exact SHA, artifact path, publication/install/health state, removed worktrees and
