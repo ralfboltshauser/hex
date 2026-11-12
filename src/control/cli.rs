@@ -8,6 +8,7 @@
 
 use std::io::Write;
 mod human;
+mod recovery;
 mod transcribe;
 
 use clap::{Args, Subcommand};
@@ -31,6 +32,11 @@ pub struct Output {
 /// The control commands at the top of `hex`.
 #[derive(Subcommand, Debug)]
 pub enum ControlCli {
+    /// Inspect and recover saved local dictations (macOS). Never pastes automatically.
+    Recovery {
+        #[command(subcommand)]
+        command: recovery::Command,
+    },
     /// Show what the running Hex is doing.
     ///
     /// Recording, meeting, model, features, permissions, window, version,
@@ -572,6 +578,7 @@ pub fn run(command: ControlCli) -> u8 {
                 crate::personal_commands::check_workspace().map(|report| println!("{report}"))
             }
         }),
+        ControlCli::Recovery { command } => recovery::run(command),
         ControlCli::Labs { command } => report(crate::labs::run(command.as_ref())),
         ControlCli::Experiments { .. } => report(crate::labs::run_retired_experiments()),
         ControlCli::Annotate { command } => capture(command),

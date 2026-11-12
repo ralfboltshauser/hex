@@ -732,6 +732,14 @@ fn rows(ui: &Ui) -> Vec<Row> {
         tr("Dictation stats"),
         tr("Add a Stats button to History that shows a summary of your retained dictations, with hex history stats"),
     ));
+    if cfg!(target_os = "macos") {
+        rows.push(row(
+        Feature::RecordingRecovery,
+        None,
+        tr("Recording recovery"),
+        tr("Keep temporary local audio and text for shortcut dictation recovery, even with History off"),
+    ));
+    }
     rows.push(row(
         Feature::KeepRecordings,
         None,
@@ -923,6 +931,7 @@ fn row_key(lab: Lab) -> &'static str {
         Feature::PickerDownloaded => "lab-picker-downloaded",
         Feature::SectionKeyAlone => "lab-section-key",
         Feature::KeepRecordings => "lab-keep-recordings",
+        Feature::RecordingRecovery => "lab-recording-recovery",
         Feature::SettingsSearch => "lab-settings-search",
         Feature::Appearance => "lab-appearance",
         Feature::ReleaseNotesLink => "lab-release-notes-link",

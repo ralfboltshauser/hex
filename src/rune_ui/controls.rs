@@ -819,12 +819,24 @@ pub(super) fn button(
     kind: ButtonKind,
     press: impl Fn(&mut Ui, &mut Tx) + 'static,
 ) -> El {
+    button_disabled(p, key, label, kind, false, press)
+}
+
+pub(super) fn button_disabled(
+    p: Paint,
+    key: &str,
+    label: &str,
+    kind: ButtonKind,
+    disabled: bool,
+    press: impl Fn(&mut Ui, &mut Tx) + 'static,
+) -> El {
     let variant = match kind {
         ButtonKind::Primary => ButtonVariant::Contrast,
         ButtonKind::Secondary => ButtonVariant::Neutral,
         ButtonKind::Danger => ButtonVariant::Danger,
     };
     Button::new(label)
+        .disabled(disabled)
         .variant(variant)
         .on_press_tx(press)
         .build_push(p.k)

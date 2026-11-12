@@ -23,11 +23,14 @@ use crate::history::{History, HistoryEntry, HistoryKind, HistoryRetention, Trans
 use crate::transcription::models::TranscriptionModelId;
 
 /// The stats dialog's width and padding.
+mod recovery;
+
 const STATS_WIDTH: f32 = 460.0;
 const PADDING: f32 = 18.0;
 
 #[derive(Default)]
 pub(super) struct HistoryPane {
+    recovery: recovery::RecoveryPane,
     store: Option<History>,
     pub(super) entries: Vec<HistoryEntry>,
     search: TextEdit,
@@ -40,6 +43,7 @@ pub(super) struct HistoryPane {
     pub(super) clear_armed: bool,
     pub(super) copied: Option<u64>,
     error: Option<String>,
+    mutation: Option<Receiver<Result<(), String>>>,
     /// Labs › Dictation stats: every retained entry summed up, while on.
     pub(super) stats: Option<HistoryStats>,
     /// The stats dialog is open.
@@ -153,7 +157,27 @@ impl HistoryPane {
         // Playback's answer returns the card to Play; it is not a reason to
         // read the stats again.
         let played = self.poll_playback();
-        let mut changed = false;
+        let mut changed = self.recovery.poll(visible);
+        if let Some(result) = self
+            .mutation
+            .as_ref()
+            .and_then(|worker| match worker.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("History deletion stopped; try again.".into()))
+                }
+                Err(TryRecvError::Empty) => None,
+            })
+        {
+            self.mutation = None;
+            self.error = result.err();
+            self.revision = None;
+            changed = true;
+        }
+        if self.mutation.is_some() {
+            return answered || played || changed;
+        }
+        let visible = visible && !self.recovery.showing;
         // A playback belongs to the card that shows its Stop: leaving the
         // entry or History, turning the lab off, or hiding the window
         // quietly ends it.
@@ -221,11 +245,20 @@ impl HistoryPane {
         self.entries.iter().find(|entry| entry.id == id)
     }
 
+    pub(super) fn recovery_fixture() -> Self {
+        Self {
+            recovery: recovery::RecoveryPane::fixture(),
+            ..Self::fixture_empty()
+        }
+    }
+
     pub(super) fn fixture() -> Self {
         let now = crate::history::now_ms();
         let entry =
             |id: u64, minutes: u64, kind, raw: &str, final_text: &str, app: Option<&str>| {
                 HistoryEntry {
+                    recovery_id: None,
+                    delivery_reported: None,
                     id,
                     timestamp_ms: now - minutes * 60_000 - 30_000,
                     kind,
@@ -335,11 +368,8 @@ fn clear(ui: &mut Ui) {
         return;
     }
     ui.history.clear_armed = false;
-    if let Some(store) = &ui.history.store {
-        if let Err(error) = store.clear() {
-            ui.history.error = Some(error.to_string());
-        }
-        ui.history.reload();
+    if ui.history.store.is_some() {
+        mutate(ui, |store| store.clear());
     } else {
         ui.history.entries.clear();
         ui.history.selected = None;
@@ -528,12 +558,32 @@ fn restore(ui: &mut Ui, id: u64, index: usize) {
     }
 }
 
+fn mutate(ui: &mut Ui, change: impl FnOnce(History) -> std::io::Result<()> + Send + 'static) {
+    if ui.history.mutation.is_some() {
+        return;
+    }
+    let Some(store) = ui.history.store.clone() else {
+        return;
+    };
+    let (send, receive) = channel();
+    let waker = ui.modes.waker.clone();
+    if std::thread::Builder::new()
+        .name("hex-history-delete".into())
+        .spawn(move || {
+            let _ = send.send(change(store).map_err(|error| error.to_string()));
+            if let Some(waker) = waker {
+                waker();
+            }
+        })
+        .is_ok()
+    {
+        ui.history.mutation = Some(receive);
+    }
+}
+
 fn delete(ui: &mut Ui, id: u64) {
-    if let Some(store) = &ui.history.store {
-        if let Err(error) = store.delete(id) {
-            ui.history.error = Some(error.to_string());
-        }
-        ui.history.reload();
+    if ui.history.store.is_some() {
+        mutate(ui, move |store| store.delete(id).map(|_| ()));
     } else {
         ui.history.entries.retain(|entry| entry.id != id);
         ui.history.selected = None;
@@ -543,7 +593,15 @@ fn delete(ui: &mut Ui, id: u64) {
 /// The header's retention menu and the list + detail body.
 pub(super) fn pane(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> (Vec<El>, El) {
     let pane = &ui.history;
-    let actions = header_actions(ui, p, layer);
+    let mut actions = if ui.history.recovery.showing {
+        Vec::new()
+    } else {
+        header_actions(ui, p, layer)
+    };
+    recovery::header(ui, p, &mut actions);
+    if ui.history.recovery.showing {
+        return (actions, recovery::pane(ui, p));
+    }
     let mut notices = Vec::new();
     if let Some(error) = &pane.error {
         notices.push(error_panel(
@@ -747,6 +805,16 @@ fn kept_label(retention: HistoryRetention) -> String {
 /// where that lab shows, and Clear all history… last. Once Clear all is
 /// chosen, the menu gives way to its confirmation until it is answered.
 fn header_actions(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Vec<El> {
+    if ui.history.mutation.is_some() {
+        return vec![crate::rune_ui::controls::button_disabled(
+            p,
+            "history-deleting",
+            tr("Deleting…"),
+            ButtonKind::Secondary,
+            true,
+            |_: &mut Ui, _| {},
+        )];
+    }
     if ui.history.clear_armed {
         return vec![
             button(
@@ -939,6 +1007,9 @@ fn detail(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
         ));
     }
     let mut facts = Vec::new();
+    if entry.delivery_reported == Some(false) {
+        facts.push((tr("Delivery failed"), tr("Saved transcript").to_string()));
+    }
     if let Some(application) = &entry.application {
         facts.push((tr("Application"), application.clone()));
     }

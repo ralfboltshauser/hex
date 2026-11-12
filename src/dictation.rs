@@ -366,6 +366,8 @@ fn signed_ms(later: CaptureInstant, earlier: CaptureInstant) -> i64 {
 }
 
 pub struct DictationClip {
+    #[cfg(target_os = "macos")]
+    recovery: Option<Box<crate::recovery::Session>>,
     samples: Vec<f32>,
     /// How many trailing samples were captured after the release. The stop
     /// tone sounds during them, so the silence gate ignores them.
@@ -382,6 +384,11 @@ pub struct DictationClip {
 }
 
 impl DictationClip {
+    #[cfg(target_os = "macos")]
+    pub fn take_recovery(&mut self) -> Option<crate::recovery::Session> {
+        self.recovery.take().map(|session| *session)
+    }
+
     pub fn duration_ms(&self) -> u64 {
         self.samples.len() as u64 * 1_000 / u64::from(PARAKEET_SAMPLE_RATE)
     }
@@ -412,6 +419,8 @@ impl DictationClip {
     #[cfg(test)]
     pub fn for_test(samples: Vec<f32>) -> Self {
         Self {
+            #[cfg(target_os = "macos")]
+            recovery: None,
             samples,
             tail_samples: 0,
             press_samples: 0,
@@ -1142,7 +1151,7 @@ impl DictationCapture {
     /// 16 kHz audio recorded so far, from `start` in final-clip coordinates.
     /// The resampler's tail is only flushed by finishing, so the clip may end
     /// slightly later than what this has returned.
-    #[cfg(test)]
+    #[cfg(any(test, target_os = "macos"))]
     pub fn recorded_from(&self, start: usize) -> &[f32] {
         let Some(recording) = &self.recording else {
             return &[];
@@ -1315,6 +1324,8 @@ impl DictationCapture {
         let capture = recording.capture.take();
         let samples = recording.finish(Some(ended_at + tail));
         Finish::Transcribe(DictationClip {
+            #[cfg(target_os = "macos")]
+            recovery: None,
             tail_samples: samples_for(kept_tail, PARAKEET_SAMPLE_RATE).min(samples.len()),
             press_samples: samples_for(pre_press, PARAKEET_SAMPLE_RATE).min(samples.len()),
             timeline,
@@ -1388,6 +1399,56 @@ mod tests {
             assert!(streamed.len() <= clip.len(), "rate {rate}");
             assert!(clip.len() - streamed.len() < 1_024, "rate {rate}");
             assert_eq!(&clip[..streamed.len()], &streamed[..], "rate {rate}");
+        }
+    }
+
+    #[test]
+    fn recorded_prefix_reconciles_to_delayed_release_for_recovery() {
+        // A recovery writer can reuse the already normalized capture samples.
+        // Its provisional prefix may extend beyond a delayed physical release;
+        // sealing must cap it to the final clip and append any resampler tail.
+        for rate in [16_000, 44_100, 48_000] {
+            for block_size in [137, 480, 1_337] {
+                for pre_roll in [Duration::ZERO, PRE_ROLL_DURATION] {
+                    let mut capture = DictationCapture::new(rate);
+                    let origin = capture_time();
+                    let warm: Vec<f32> = (0..rate)
+                        .map(|index| (index as f32 * 0.017).sin() * 0.2)
+                        .collect();
+                    capture.ingest(&warm, origin);
+                    let pressed = origin + Duration::from_millis(75);
+                    capture.start_at_press(pressed, pre_roll);
+                    let source: Vec<f32> = (0..rate * 2)
+                        .map(|index| (index as f32 * 0.031).sin() * 0.3)
+                        .collect();
+                    let mut projected = Vec::new();
+                    let mut frames = 0;
+                    for block in source.chunks(block_size) {
+                        frames += block.len();
+                        let through = origin + crate::audio::duration_for_frames(frames, rate);
+                        capture.ingest(block, through);
+                        capture.become_intentional(through);
+                        if capture.is_intentional() {
+                            projected.extend_from_slice(capture.recorded_from(projected.len()));
+                        }
+                    }
+                    let released = pressed + Duration::from_secs(1);
+                    let Finish::Transcribe(clip) =
+                        capture.finish_with_tail(released, POST_RELEASE_TAIL)
+                    else {
+                        panic!("a one-second intended hold must transcribe");
+                    };
+                    assert!(
+                        projected.len() > clip.samples.len(),
+                        "exercise delayed release"
+                    );
+                    projected.truncate(clip.samples.len());
+                    assert_eq!(
+                        projected, clip.samples,
+                        "rate={rate} block={block_size} pre_roll={pre_roll:?}"
+                    );
+                }
+            }
         }
     }
 

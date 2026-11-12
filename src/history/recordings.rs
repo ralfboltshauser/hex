@@ -29,19 +29,48 @@ const DIRECTORY: &str = "history-audio";
 const RETRANSCRIBE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 /// One dictation's 16 kHz mono audio, kept for History.
-#[derive(Clone, Debug)]
-pub struct Recording(Vec<f32>);
+#[derive(Clone)]
+pub struct Recording(Source);
+
+#[derive(Clone)]
+enum Source {
+    Samples(Vec<f32>),
+    #[cfg(target_os = "macos")]
+    Recovery(crate::recovery::Session),
+}
+impl std::fmt::Debug for Recording {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Source::Samples(samples) => formatter
+                .debug_struct("Recording")
+                .field("samples", &samples.len())
+                .finish(),
+            #[cfg(target_os = "macos")]
+            Source::Recovery(session) => formatter
+                .debug_struct("Recording")
+                .field("recovery_id", &session.id().as_str())
+                .finish(),
+        }
+    }
+}
 
 impl Recording {
     /// A copy of `samples` while Labs › Keep recordings is on; nothing
     /// otherwise, so dictation audio is never kept by default.
     pub fn keep(samples: &[f32]) -> Option<Self> {
-        (crate::labs::keep_recordings() && !samples.is_empty()).then(|| Self(samples.to_vec()))
+        (crate::labs::keep_recordings() && !samples.is_empty())
+            .then(|| Self(Source::Samples(samples.to_vec())))
+    }
+
+    /// Keep the existing durable source, without another whole-clip RAM copy.
+    #[cfg(target_os = "macos")]
+    pub fn keep_recovery(session: &crate::recovery::Session) -> Option<Self> {
+        crate::labs::keep_recordings().then(|| Self(Source::Recovery(session.clone())))
     }
 
     #[cfg(test)]
     pub fn from_samples(samples: Vec<f32>) -> Self {
-        Self(samples)
+        Self(Source::Samples(samples))
     }
 }
 
@@ -80,13 +109,31 @@ pub(super) fn write(directory: &Path, id: u64, recording: &Recording) -> io::Res
             sample_format: SampleFormat::Int,
         };
         let mut writer = WavWriter::new(BufWriter::new(&file), spec).map_err(io::Error::other)?;
-        for sample in &recording.0 {
-            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
-            writer.write_sample(sample).map_err(io::Error::other)?;
+        let mut write_samples = |samples: &[f32]| -> io::Result<()> {
+            for sample in samples {
+                let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+                writer.write_sample(sample).map_err(io::Error::other)?;
+            }
+            Ok(())
+        };
+        match &recording.0 {
+            Source::Samples(samples) => write_samples(samples)?,
+            #[cfg(target_os = "macos")]
+            Source::Recovery(session) => {
+                let mut reader = session
+                    .reader()
+                    .map_err(|_| io::Error::other("saved recovery audio unavailable"))?;
+                while let Some(samples) = reader.next()? {
+                    write_samples(&samples)?;
+                }
+            }
         }
         writer.finalize().map_err(io::Error::other)?;
         file.sync_all()?;
         fs::rename(&temporary, &target)?;
+        crate::durable::sync_directory(directory)?;
+        #[cfg(target_os = "macos")]
+        crate::durable::full_sync(&file)?;
         Ok(fs::metadata(&target)?.len())
     })();
     if written.is_err() {
@@ -183,6 +230,59 @@ fn restrict_directory(_directory: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::transcription::models::{CustomModelId, TranscriptionModelId};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_protected_recording_streams_to_a_private_wav_and_keeps_its_source() {
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("hex-history-handoff-{nonce}"));
+        let client = crate::recovery::Client::start(base.join("recovery")).unwrap();
+        let session = client.begin(Default::default()).unwrap();
+        assert_eq!(client.list().unwrap().len(), 1);
+        let samples: Vec<f32> = (0..(32 * 16_000 + 777))
+            .map(|index| (index % 512) as f32 / 512.0)
+            .collect();
+        for (index, chunk) in samples.chunks(16_000).enumerate() {
+            session.offer((index * 16_000) as u64, chunk).unwrap();
+        }
+        session.seal(samples.len() as u64).unwrap();
+        session.save_raw("synthetic retained recording").unwrap();
+        let labs = crate::app_settings::LabsSettings {
+            keep_recordings: true,
+            ..Default::default()
+        };
+        crate::labs::apply(&labs);
+        let recording = Recording::keep_recovery(&session).unwrap();
+        assert!(
+            matches!(recording.0, Source::Recovery(_)),
+            "no whole-clip RAM copy"
+        );
+        let retained = base.join("retained");
+        let bytes = write(&retained, 1, &recording).unwrap();
+        assert!(bytes >= (samples.len() * 2) as u64);
+        assert_eq!(
+            client.list().unwrap().len(),
+            1,
+            "publication does not prematurely reclaim its source"
+        );
+        client.delete(session.id().clone()).unwrap();
+        let mut wav = hound::WavReader::open(path(&retained, 1)).unwrap();
+        assert_eq!(wav.spec().sample_rate, 16_000);
+        let saved: Vec<_> = wav.samples::<i16>().map(Result::unwrap).collect();
+        assert_eq!(saved.len(), samples.len());
+        for (saved, expected) in saved.iter().zip(&samples) {
+            assert_eq!(*saved, (expected * f32::from(i16::MAX)).round() as i16);
+        }
+        drop(wav);
+        crate::labs::apply(&Default::default());
+        client.shutdown().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn transcribe_again_returns_once_the_run_ends() {

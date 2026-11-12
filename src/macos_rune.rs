@@ -128,6 +128,7 @@ pub(crate) struct RuntimeHandle {
     meeting_requests: SyncSender<MeetingRequest>,
     recognition_controls: SyncSender<RecognitionControl>,
     history: Option<crate::history::History>,
+    recovery: crate::recovery::Client,
     indicator: crate::dictation::indicator::DictationIndicatorSender,
 }
 
@@ -139,6 +140,10 @@ impl RuntimeHandle {
 
     pub(crate) fn history(&self) -> Option<crate::history::History> {
         self.history.clone()
+    }
+
+    pub(crate) fn recovery(&self) -> crate::recovery::Client {
+        self.recovery.clone()
     }
 
     /// The dictation HUD, for HUD Lab.
@@ -359,6 +364,13 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
     // The microphone stays cold until setup is ready; the runtime starts it.
     let (recognition_start, start_receiver) = mpsc::sync_channel(1);
     let recognition_indicator = indicator.clone();
+    let recovery = crate::recovery::Client::start(
+        crate::app_paths::support_dir()?.join("dictation-recovery"),
+    )?;
+    if let Some(history) = &history {
+        history.attach_recovery(recovery.clone());
+    }
+    let recognition_recovery = recovery.clone();
     let recognition_history = history.clone();
     let started_at = crate::desktop::events::now_ms();
     let listener_failure = Arc::new(Mutex::new(None::<String>));
@@ -385,9 +397,12 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
                     listener.device.as_deref(),
                     shutdown,
                     Some(recognition_indicator.clone()),
-                    recognition_history,
                     Some(recognition_control_receiver),
-                    transformations,
+                    crate::recognition::Services {
+                        history: recognition_history,
+                        transformations,
+                        recovery: recognition_recovery,
+                    },
                 )
             }));
             let failure = match result {
@@ -419,6 +434,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
         meeting_requests: meeting_requests.clone(),
         recognition_controls: recognition_controls.clone(),
         history: history.clone(),
+        recovery,
         indicator: indicator.clone(),
     };
     RUNTIME
@@ -564,6 +580,11 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
             if worker.join().is_err() {
                 tracing::error!("{name} worker panicked during shutdown");
             }
+        }
+        if let Some(runtime) = self::runtime()
+            && runtime.recovery().shutdown().is_err()
+        {
+            tracing::warn!("recovery drain did not finish; saved checkpoints remain discoverable");
         }
         crate::audio::recording_environment::wait_until_restored(Duration::from_secs(2));
         if let Err(error) = drained_event_log.flush_within(Duration::from_millis(500)) {

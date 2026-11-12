@@ -14,6 +14,17 @@ pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
     OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
+/// A strict macOS device barrier, kept separate from settings' fsync policy.
+#[cfg(target_os = "macos")]
+pub(crate) fn full_sync(file: &fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_FULLFSYNC takes a live descriptor; its final argument is ignored.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Persists a rename, creation, or removal in `directory` (Unix only; see
 /// the module documentation).
 pub(crate) fn sync_directory(directory: &Path) -> io::Result<()> {

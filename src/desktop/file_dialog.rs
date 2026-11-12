@@ -19,6 +19,10 @@ fn show(dialog: Dialog, reply: Reply) {
                 ..Default::default()
             };
             let choice = match dialog.target {
+                Target::Save { file_name } => {
+                    options.file_name = Some(file_name);
+                    pollster::block_on(dialogs.save(options))
+                }
                 Target::Folder => pollster::block_on(dialogs.open_folder(options)),
                 Target::File(filters) => {
                     for filter in filters {
@@ -39,6 +43,8 @@ pub(crate) struct Dialog {
 }
 
 pub(crate) enum Target {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Save { file_name: String },
     /// One existing file.
     File(Vec<Filter>),
     /// Only the macOS meetings folder asks for one yet.

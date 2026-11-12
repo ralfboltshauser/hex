@@ -1261,6 +1261,12 @@ benchmarks and `HEX_STREAMING=1` streams on any device, including a CPU
 `source=stream|offline|fallback` and `finish_ms`. The macOS "Transcribe during
 pauses" setting no longer affects dictation.
 
+`recorded_prefix_reconciles_to_delayed_release_for_recovery` checks reuse of the
+normalized capture prefix at 16/44.1/48 kHz, three packet sizes, and with/without
+pre-roll. A delayed release requires capping that provisional prefix to the
+finished clip; the kept samples match exactly. This is synthetic capture proof,
+not implemented recovery persistence, physical microphone or paste proof.
+
 Checks: `recorded_audio_is_a_prefix_of_the_finished_clip` (16, 44.1, and
 48 kHz), `resampled_clips_keep_the_last_word_through_a_delayed_release` (streamed
 and not), `a_stream_starts_with_the_backlog_and_feeds_in_blocks`,
