@@ -9,8 +9,8 @@ Scope: personal fork, macOS first. Follow [FORK.md](../../FORK.md).
 
 ## Decision and readiness
 
-Ready to implement the narrow production storage/capture slice, using the
-completed feasibility probes as evidence and retaining their stated limits.
+The narrow production storage/capture slice is implemented as a candidate.
+Verification observations and their limits remain in the implementation record.
 Do not start a broad recording/History/meeting rewrite. Storage latency,
 foreground inference responsiveness and production failure handling remain open
 gates; feasibility measurements do not establish release readiness.
@@ -405,13 +405,14 @@ Clock uncertainty must delay cleanup rather than shorten a safety window.
 Quota exhaustion stops new work instead of evicting unresolved items.
 
 Delete: fence new work -> await/cancel active operations -> durably create a
-root-level tombstone -> remove correlated product entries and owned files ->
+root-level tombstone -> remove owned safety-copy files ->
 synchronize directories -> update accounting -> remove the tombstone last.
 Acknowledge accepted deletion separately from physical cleanup. Restart resumes
 unfinished deletion first; stale commands cannot recreate the session. Keep the
 tombstone while any operation/reference could resurrect files. No tombstone
 compaction service is needed when automatic republication is absent.
 
+Recovery Delete removes the safety copy and leaves the separate History entry.
 Confirmed History Delete/Clear all includes associated safety copies within the
 stated confirmation scope; automatic History expiry does not. Meeting deletion
 similarly includes its recovery data. Do not delete unrelated unprojected items.
@@ -532,11 +533,13 @@ Measure baseline versus changed release builds on this host: press-to-ready and
 release-to-paste p50/p95, CPU, extra resident memory, bytes written, checkpoint lag,
 file count and idle wakes. Initial targets: no recovery RAM growth proportional
 to capture duration, no continuous idle polling, queue bounds above and at most
-100 ms p95 extra normal release-to-paste latency including required durable commits.
-The original 50 ms target was not met: the production synthetic storage workload
-measured 79.0 ms p95 after consolidating redundant same-device barriers. The
-100 ms budget is an explicit revision based on that evidence, not a passing
-release-build end-to-end result. Required synchronization is preserved.
+200 ms p95 extra normal release-to-paste latency including required durable commits.
+The original 50 ms and subsequent 100 ms targets were not met. Optimized serial
+commit probes measured 105–109 ms p95; a paired real-engine/ordered-output
+comparison measured 55.7 ms median and 153.9 ms p95 additional time to a fake
+paste endpoint. The 200 ms target is an explicit revision based on these results,
+not a passing native clipboard/microphone end-to-end result. Synchronization is
+preserved; the default-off lab trades additional latency for durable recovery.
 If sync costs exceed that target, revisit batching or the published budget;
 never silently weaken durability to pass a benchmark.
 

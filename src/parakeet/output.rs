@@ -392,4 +392,132 @@ mod tests {
         client.shutdown().unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
+    #[test]
+    #[ignore = "explicit installed-model synthetic latency comparison; never uses a microphone or clipboard"]
+    fn compare_optimized_output_latency_with_recovery() {
+        use crate::transcription::{Transcriber, WarmTranscriber};
+        let wav =
+            std::env::var_os("HEX_RECOVERY_SYNTHETIC_WAV").expect("explicit synthetic fixture");
+        let mut wav = hound::WavReader::open(wav).unwrap();
+        assert_eq!(wav.spec().sample_rate, 16_000);
+        assert_eq!(wav.spec().channels, 1);
+        let samples: Vec<f32> = wav
+            .samples::<i16>()
+            .map(|sample| sample.unwrap() as f32 / 32768.0)
+            .collect();
+        let selection = crate::transcription::models::TranscriptionSelection::default();
+        let model = Transcriber::load_selection(&selection).unwrap();
+        let engine = TranscriptionEngine::start(WarmTranscriber::serving(model)).unwrap();
+        let offline = || {
+            let selection = selection.clone();
+            Box::new(move |model: &mut WarmTranscriber, samples: Vec<f32>| {
+                model
+                    .activate(&selection)
+                    .map_err(|error| error.to_string())?
+                    .transcribe(samples)
+                    .map_err(|error| error.to_string())
+            }) as crate::transcription::engine::Offline
+        };
+        engine
+            .finish_with(None, samples.clone(), offline())
+            .unwrap()
+            .wait()
+            .unwrap();
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let nonce: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("hex-output-latency-{nonce}"));
+        let client = Client::start(root.clone()).unwrap();
+        let mut baseline = Vec::new();
+        let mut protected = Vec::new();
+        let mut admission = Vec::new();
+        let mut extra = Vec::new();
+        for pair in 0..30 {
+            let mut pair_ms = [0.0; 2];
+            for enabled in if pair % 2 == 0 {
+                [false, true]
+            } else {
+                [true, false]
+            } {
+                let started = Instant::now();
+                let session = client.begin(selection.clone()).unwrap();
+                admission.push(started.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(client.list().unwrap().len(), 1);
+                if enabled {
+                    for (index, chunk) in samples.chunks(16_000).enumerate() {
+                        session.offer((index * 16_000) as u64, chunk).unwrap();
+                    }
+                }
+                let started = Instant::now();
+                if enabled {
+                    session.seal(samples.len() as u64).unwrap();
+                }
+                let transcript = engine
+                    .finish_with(None, samples.clone(), offline())
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+                assert!(!transcript.text.is_empty());
+                if enabled {
+                    session.save_raw(&transcript.text).unwrap();
+                }
+                let mut output = job(session.clone());
+                if let OutputJob::Completed {
+                    control, result, ..
+                } = &mut output
+                {
+                    if !enabled {
+                        Arc::get_mut(control).unwrap().recovery = None;
+                    }
+                    let completed = result.as_mut().as_mut().unwrap();
+                    completed.text = transcript.text.clone();
+                    completed.raw = transcript.text;
+                }
+                let mut delivered_ms = None;
+                let event = finish_output(
+                    output,
+                    &mut |_, _, commit| {
+                        assert!(commit());
+                        delivered_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                        Ok(())
+                    },
+                    &mut None,
+                    None,
+                );
+                assert!(matches!(
+                    event,
+                    WorkerEvent::Completed { result: Ok(_), .. }
+                ));
+                let elapsed = delivered_ms.unwrap();
+                pair_ms[usize::from(enabled)] = elapsed;
+                if enabled {
+                    protected.push(elapsed);
+                } else {
+                    baseline.push(elapsed);
+                }
+                client.delete(session.id().clone()).unwrap();
+            }
+            extra.push(pair_ms[1] - pair_ms[0]);
+        }
+        for values in [&mut baseline, &mut protected, &mut admission, &mut extra] {
+            values.sort_by(f64::total_cmp);
+        }
+        println!(
+            "optimized_output_comparison {}",
+            serde_json::json!({
+                "pairs":30,"audio_ms":samples.len()/16,"model":selection.model.as_str(),
+                "baseline_p50_ms":baseline[15],"baseline_p95_ms":baseline[28],
+                "protected_p50_ms":protected[15],"protected_p95_ms":protected[28],
+                "paired_extra_p50_ms":extra[15],"paired_extra_p95_ms":extra[28],
+                "nonblocking_admission_p95_ms":admission[56],
+                "includes":"asynchronous seal, real foreground inference, raw commit and real ordered output through delivery intent",
+                "excludes":"physical shortcut/microphone, processing transformations, native clipboard and delivery outcome"
+            })
+        );
+        client.shutdown().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
