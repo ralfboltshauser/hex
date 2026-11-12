@@ -19,6 +19,9 @@ use crate::feedback;
 use crate::suppression::PendingInputEvents;
 use crate::transcription::engine::TranscriptionEngine;
 
+mod commands;
+mod recovery;
+
 const RECOGNITION_QUEUE_CAPACITY: usize = 64;
 const MAX_RECOGNITION_BACKLOG: Duration = Duration::from_millis(500);
 /// How long past the tail itself a finish waits for the stream to deliver it.
@@ -47,6 +50,7 @@ impl Drop for RecognitionAudio {
 use crate::capture_host::{CaptureAudio, CaptureSink, CaptureSinkClosed};
 
 pub enum DictationAudioEvent {
+    ProtectionFailed,
     OpenFailed {
         capture_generation: u64,
         error: String,
@@ -111,6 +115,7 @@ enum CaptureKind {
 }
 
 enum Command {
+    ConfigureRecovery(crate::recovery::Client),
     Start {
         at: CaptureInstant,
         kind: CaptureKind,
@@ -155,6 +160,7 @@ enum Command {
 }
 
 struct Owner {
+    recovery: recovery::Protection,
     input: RecoveringAudioInput,
     release_while_idle: bool,
     pending_capture: Option<PendingCapture>,
@@ -255,6 +261,12 @@ impl DictationAudio {
                 .spawn(move || owner.run())?,
         );
         Ok(audio)
+    }
+
+    pub fn configure_recovery(&self, client: crate::recovery::Client) -> Result<()> {
+        self.commands
+            .send(Command::ConfigureRecovery(client))
+            .map_err(|_| eyre!("audio owner stopped"))
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -563,6 +575,7 @@ impl Owner {
         let (event_sender, events) = mpsc::channel();
         let stream_opened_at = input.is_open().then(Instant::now);
         let owner = Self {
+            recovery: recovery::Protection::default(),
             input,
             release_while_idle,
             pending_capture: None,
@@ -611,6 +624,7 @@ impl Owner {
                 if !self.handle(command) {
                     break;
                 }
+                self.advance_protection(false);
                 self.reconcile_input();
                 continue;
             }
@@ -619,129 +633,9 @@ impl Owner {
                 .input
                 .recv_timeout(Duration::from_millis(10), capture_idle);
             self.handle_input(event);
+            self.advance_protection(false);
             self.reconcile_input();
         }
-    }
-
-    fn handle(&mut self, command: Command) -> bool {
-        match command {
-            Command::Start { at, kind, reply } => {
-                // Draining can discover a failure belonging to the previous capture or idle
-                // period. Validate and advance the new capture only after that drain.
-                if self.input.is_open() && !self.input.is_recovering() {
-                    self.drain_through(at);
-                }
-                if self.input.is_recovering() {
-                    let _ = reply.send(false);
-                    return true;
-                }
-                self.state.capture_generation.fetch_add(1, Ordering::AcqRel);
-                if self.input.is_open() {
-                    self.start_capture_at(kind, at);
-                } else {
-                    self.pending_capture = Some(PendingCapture {
-                        at,
-                        kind,
-                        intentional_at: None,
-                        _capture: CaptureMarker::new(),
-                    });
-                    self.input.request_open();
-                }
-                self.state.recording.store(true, Ordering::Release);
-                let _ = reply.send(true);
-            }
-            Command::BecomeIntentional { at, reply } => {
-                self.drain_through(at);
-                let became_intentional = if let Some(pending) = &mut self.pending_capture {
-                    pending.mark_intentional(at);
-                    false
-                } else {
-                    self.capture.become_intentional(at)
-                };
-                let _ = reply.send(became_intentional);
-            }
-            Command::MarkIntentional { reply } => {
-                let became_intentional = if let Some(pending) = &mut self.pending_capture {
-                    pending.mark_intentional(pending.at + crate::dictation::MINIMUM_HOLD_DURATION);
-                    false
-                } else {
-                    self.capture.mark_intentional()
-                };
-                let _ = reply.send(became_intentional);
-            }
-            Command::Finish { at, tail, reply } => {
-                self.drain_through(at);
-                let announced = self.pending_capture.is_none()
-                    && !tail.is_zero()
-                    && self.capture.would_transcribe(at);
-                if announced {
-                    // A release that will transcribe sounds at once, not after
-                    // its tail, and a muted output is restored first.
-                    self.capture
-                        .end_recording_environment_then(feedback::deferred_stop());
-                }
-                let (tail, deferred) = if announced {
-                    self.drain_tail(at, feedback::stop_tone_length())
-                } else {
-                    (tail, None)
-                };
-                let mut finish = if self.pending_capture.take().is_some() {
-                    if !self.capture_sink_open() {
-                        self.input.cancel_open();
-                    }
-                    Finish::Discard
-                } else {
-                    self.capture.finish_with_tail(at, tail)
-                };
-                if let Finish::Transcribe(clip) = &mut finish {
-                    clip.set_source(self.clip_source());
-                    if clip.is_digital_silence() {
-                        self.reopen_silent_stream();
-                    }
-                }
-                self.state.recording.store(false, Ordering::Release);
-                let _ = reply.send(finish);
-                if let Some(event) = deferred {
-                    self.handle_input(event);
-                }
-            }
-            Command::Cancel { reply } => {
-                self.pending_capture = None;
-                if !self.input.is_open() && !self.capture_sink_open() {
-                    self.input.cancel_open();
-                }
-                self.capture.cancel();
-                self.state.recording.store(false, Ordering::Release);
-                let _ = reply.send(());
-            }
-            Command::SelectMicrophone { revision, device } => {
-                self.input.request_selection(revision, device.as_deref());
-            }
-            Command::SetReleaseWhileIdle(release) => {
-                self.release_while_idle = release;
-            }
-            #[cfg(test)]
-            Command::InvalidateRecognition { reply } => {
-                let _ = reply.send(self.next_recognition_generation());
-            }
-            #[cfg(hex_capture)]
-            Command::OpenCaptureSink { sink, since, reply } => {
-                self.capture_sink = Some(CaptureSink::new(sink, since));
-                if !self.input.is_active() {
-                    self.input.request_open();
-                }
-                let _ = reply.send(());
-            }
-            #[cfg(hex_capture)]
-            Command::CloseCaptureSink { through, reply } => {
-                if self.capture_sink.is_some() && self.input.is_open() {
-                    self.drain_through(through);
-                }
-                let _ = reply.send(self.capture_sink.take().map(CaptureSink::close));
-            }
-            Command::Shutdown => return false,
-        }
-        true
     }
 
     fn drain_through(&mut self, boundary: CaptureInstant) {
@@ -856,6 +750,7 @@ impl Owner {
                     // filled with silence on the timeline instead of failing
                     // the capture.
                     self.discontinuity_at = Some(Instant::now());
+                    self.recovery.note_gap(gap);
                     padding = (gap.as_secs_f64() * f64::from(self.sample_rate())).round() as usize;
                     tracing::warn!(
                         gap_ms = gap.as_millis() as u64,
@@ -1087,6 +982,7 @@ impl Owner {
     }
 
     fn start_capture_at(&mut self, kind: CaptureKind, at: CaptureInstant) {
+        self.recovery.begin(matches!(kind, CaptureKind::Hotkey));
         match kind {
             CaptureKind::Hotkey => self.capture.start_hotkey_at(
                 at,
@@ -1115,8 +1011,13 @@ impl Owner {
             .started_at()
             .filter(|_| self.keep_on_loss || (keep_hotkey && self.capture.is_intentional()))?;
         let through = through.filter(|through| *through > started_at)?;
+        self.advance_protection(true);
         match self.capture.finish_with_tail(through, Duration::ZERO) {
             Finish::Transcribe(mut clip) => {
+                if self.recovery.finish(&mut clip).is_err() {
+                    let _ = self.events.send(DictationAudioEvent::ProtectionFailed);
+                    return None;
+                }
                 clip.set_source(self.clip_source());
                 Some(clip)
             }

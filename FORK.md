@@ -49,6 +49,24 @@ still needs observation across an installed update. This does not add notarizati
 `scripts/personal/check.sh` checks that two different signed executables satisfy
 each other's designated requirements and rejects a different app identifier.
 
+### Local shortcut recording recovery
+
+The default-off macOS Recording recovery lab preserves intentional shortcut
+capture audio and raw/final transcripts independently of History. It addresses
+lost work after capture, processing or delivery failure. Recovery actions remain
+available after disabling capture protection and never automatically paste,
+download/switch a model or rerun transformations. Explicit History deletion also
+fences associated safety copies; ordinary History expiry leaves unresolved work.
+
+Integration points are the existing normalized audio owner, optional clip/job
+handle, ordered output, concrete History adapter and authenticated control host.
+`recovery` owns one disk worker, strict private storage, durability, quotas and
+restart-safe deletion; shared UI and engine ownership remain in place. Native
+meeting storage is a separate stage. Read `docs/recording-recovery.md` for the
+format, bounds and proof limits. Authoritative focused checks are in
+`scripts/personal/check.sh`; complete upstream checks and signed-package
+verification remain required for publication.
+
 ## Update and delivery
 
 Run commands from the checkout being checked. State and artifacts are shared

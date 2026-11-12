@@ -134,6 +134,7 @@ impl Feature {
             | Self::PickerDownloaded
             | Self::SectionKeyAlone
             | Self::KeepRecordings
+            | Self::RecordingRecovery
             | Self::SettingsSearch
             | Self::Appearance
             | Self::ReleaseNotesLink
@@ -237,6 +238,7 @@ impl Feature {
             | Self::MeetingNotesFile
             | Self::MoreDictationShortcuts => 20261109,
             Self::AppModelSwitching | Self::ApiTimestamps | Self::PauseMenu => 20261110,
+            Self::RecordingRecovery => 20261112,
         }
     }
 
@@ -309,7 +311,7 @@ impl Feature {
             Self::KeepOnClipboard | Self::CopyOnly => {
                 cfg!(any(target_os = "macos", target_os = "windows"))
             }
-            Self::ReturnToApp => cfg!(target_os = "macos"),
+            Self::ReturnToApp | Self::RecordingRecovery => cfg!(target_os = "macos"),
             Self::TapOrHold => cfg!(any(target_os = "macos", target_os = "linux")),
             Self::KeyboardModelSwitching => crate::keyboard_input_sources::available(),
             Self::AppModelSwitching => cfg!(any(target_os = "macos", target_os = "windows")),
@@ -405,6 +407,7 @@ impl Feature {
             Self::PickerDownloaded => "picker-downloaded",
             Self::SectionKeyAlone => "section-key",
             Self::KeepRecordings => "keep-recordings",
+            Self::RecordingRecovery => "recording-recovery",
             Self::SettingsSearch => "settings-search",
             Self::Appearance => "appearance",
             Self::ReleaseNotesLink => "release-notes-link",
@@ -483,6 +486,7 @@ impl Feature {
             Self::PickerDownloaded => "labs.picker_downloaded",
             Self::SectionKeyAlone => "labs.section_key_alone",
             Self::KeepRecordings => "labs.keep_recordings",
+            Self::RecordingRecovery => "labs.recording_recovery",
             Self::SettingsSearch => "labs.settings_search",
             Self::Appearance => "labs.appearance",
             Self::ReleaseNotesLink => "labs.release_notes_link",
@@ -565,6 +569,7 @@ impl Feature {
             Self::PickerDownloaded => settings.labs.picker_downloaded,
             Self::SectionKeyAlone => settings.labs.section_key_alone,
             Self::KeepRecordings => settings.labs.keep_recordings,
+            Self::RecordingRecovery => settings.labs.recording_recovery,
             Self::SettingsSearch => settings.labs.settings_search,
             Self::Appearance => settings.labs.appearance,
             Self::ReleaseNotesLink => settings.labs.release_notes_link,
@@ -644,6 +649,7 @@ impl Feature {
             &mut labs.picker_downloaded,
             &mut labs.section_key_alone,
             &mut labs.keep_recordings,
+            &mut labs.recording_recovery,
             &mut labs.settings_search,
             &mut labs.appearance,
             &mut labs.release_notes_link,
@@ -730,6 +736,7 @@ impl Feature {
             Self::ModelInPlace => settings.labs.model_in_place = on,
             Self::PickerDownloaded => settings.labs.picker_downloaded = on,
             Self::KeepRecordings => settings.labs.keep_recordings = on,
+            Self::RecordingRecovery => settings.labs.recording_recovery = on,
             Self::SettingsSearch => settings.labs.settings_search = on,
             Self::Appearance => settings.labs.appearance = on,
             Self::ReleaseNotesLink => settings.labs.release_notes_link = on,
@@ -858,6 +865,7 @@ const PAUSE_MENU: u64 = APP_MODEL_SWITCHING << 1;
 /// The next bit above Pause from menu bar: the local API's
 /// `timestamps=segment|word` returns native timings.
 const API_TIMESTAMPS: u64 = PAUSE_MENU << 1;
+const RECORDING_RECOVERY: u64 = API_TIMESTAMPS << 1;
 
 /// This process's `labs` switches: unknown until settings load or one is
 /// first read.
@@ -914,6 +922,11 @@ fn encode_where(settings: &LabsSettings, reaches: impl Fn(Feature) -> bool) -> u
     let minutes = u64::from(settings.unload_idle_minutes.clamp(1, 24 * 60)) << MINUTES_SHIFT;
     [
         (Feature::LiveText, settings.live_text, LIVE_TEXT),
+        (
+            Feature::RecordingRecovery,
+            settings.recording_recovery,
+            RECORDING_RECOVERY,
+        ),
         (
             Feature::FailureNotices,
             settings.failure_notices,

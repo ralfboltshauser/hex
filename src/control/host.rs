@@ -151,6 +151,10 @@ fn command(host: &dyn Host, command: ControlCommand) -> ControlReply {
                     .map(|()| ControlReply::done(dictation_message(action)))
             }))
         }
+        ControlCommand::Recovery { .. } => ControlReply::error(
+            "unsupported",
+            "local recording recovery is currently available on macOS",
+        ),
         ControlCommand::PasteLast => reply(
             host.paste_last()
                 .map(|()| ControlReply::done("Pasting the last dictation")),

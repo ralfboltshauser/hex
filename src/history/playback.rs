@@ -203,6 +203,76 @@ fn play(path: &Path, generation: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+impl Playback {
+    /// Streams saved recovery frames through the same playback ownership and
+    /// Stop mechanism. At most two one-second source buffers are queued.
+    pub fn start_recovery(
+        client: crate::recovery::Client,
+        id: crate::recovery::SessionId,
+        wake: impl Fn() + Send + 'static,
+    ) -> Self {
+        let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        let (sender, receiver) = channel();
+        let started = thread::Builder::new()
+            .name("hex-recovery-playback".into())
+            .spawn(move || {
+                let result = (|| {
+                    let mut reader = client
+                        .reader(id)
+                        .map_err(|_| "The recording could not be read.")?;
+                    let mut sink = DeviceSinkBuilder::open_default_sink()
+                        .map_err(|_| "No audio output is available.")?;
+                    sink.log_on_drop(false);
+                    let player = Player::connect_new(sink.mixer());
+                    while let Some(samples) = reader
+                        .next()
+                        .map_err(|_| "The recording could not be read.")?
+                    {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while player.len() >= 2 {
+                            if GENERATION.load(Ordering::Acquire) != generation {
+                                player.stop();
+                                return Ok(());
+                            }
+                            if Instant::now() >= deadline {
+                                return Err("Playback stopped.");
+                            }
+                            thread::sleep(CHECK_INTERVAL);
+                        }
+                        if GENERATION.load(Ordering::Acquire) != generation {
+                            player.stop();
+                            return Ok(());
+                        }
+                        player.append(SamplesBuffer::new(
+                            NonZeroU16::new(1).unwrap(),
+                            NonZeroU32::new(16_000).unwrap(),
+                            samples,
+                        ));
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !player.empty() {
+                        if GENERATION.load(Ordering::Acquire) != generation
+                            || Instant::now() >= deadline
+                        {
+                            player.stop();
+                            break;
+                        }
+                        thread::sleep(CHECK_INTERVAL);
+                    }
+                    Ok(())
+                })();
+                let _ = sender.send(result);
+                wake();
+            });
+        Self {
+            id: generation,
+            worker: started.is_ok().then_some(receiver),
+            error: started.err().map(|_| "Playback stopped."),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

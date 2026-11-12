@@ -343,3 +343,9 @@ pub fn unload_idle() -> Option<std::time::Duration> {
     (state & UNLOAD_IDLE != 0)
         .then(|| std::time::Duration::from_secs(((state >> MINUTES_SHIFT) & MINUTES_MASK) * 60))
 }
+
+/// Temporary recovery copies of intentional macOS shortcut dictations.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn recording_recovery() -> bool {
+    on(RECORDING_RECOVERY) && Feature::RecordingRecovery.on_this_os()
+}

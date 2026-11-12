@@ -52,6 +52,7 @@ impl Feature {
     pub const fn group(self) -> Group {
         match self {
             Self::LiveText
+            | Self::RecordingRecovery
             | Self::FailureNotices
             | Self::LiveTyping
             | Self::NotchIndicator

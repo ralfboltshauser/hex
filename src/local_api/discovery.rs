@@ -72,12 +72,19 @@ pub fn call_control(
     request: &crate::control::ControlRequest,
 ) -> Result<crate::control::ControlResponse> {
     let body = serde_json::to_vec(request)?;
+    let response_limit = match &request.command {
+        crate::control::ControlCommand::Recovery {
+            operation: crate::control::recovery::RecoveryCommand::Text { .. },
+        } => crate::control::recovery::MAX_TRANSCRIPT_BYTES * 6 + 64 * 1024,
+        crate::control::ControlCommand::Recovery { .. } => 4 * 1024 * 1024,
+        _ => 1024 * 1024,
+    };
     // The app answers within the command's deadline or the server replies 504.
     let (status, body) = post_json(
         "/control",
         &body,
         request.command.deadline() + Duration::from_secs(5),
-        1024 * 1024,
+        response_limit,
     )?;
     if status != 200 {
         let code = error_code(status, &body);

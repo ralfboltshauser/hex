@@ -165,6 +165,8 @@ mod tests {
         audio_ms: u64,
     ) -> HistoryEntry {
         HistoryEntry {
+            recovery_id: None,
+            delivery_reported: None,
             id: day,
             timestamp_ms: day * DAY + 1_000,
             kind: HistoryKind::Dictation,

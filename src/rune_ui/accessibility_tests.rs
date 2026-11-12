@@ -303,3 +303,54 @@ fn settings_reopened_sends_its_whole_tree_to_the_new_adapter() {
         "the reopened window shows Settings"
     );
 }
+
+#[test]
+fn recovery_scene_renders_with_named_actions() {
+    let mut rt = runtime("history-recovery");
+    assert!(
+        rt.find("history-retention-field-trigger").is_none(),
+        "History retention does not describe safety-copy expiry"
+    );
+    let tree = rt.accessibility_json();
+    let controls = nodes(&tree);
+    for key in [
+        "recovery-copy",
+        "recovery-retry",
+        "recovery-delete",
+        "recovery-export-audio",
+    ] {
+        assert!(
+            controls.iter().any(|(path, node)| path.contains(key)
+                && node["name"].as_str().is_some_and(|name| !name.is_empty())),
+            "named recovery action: {key}"
+        );
+    }
+    let Ok(gpu) = rune::render::Gpu::try_new(rune::render::Gpu::instance(), None) else {
+        assert!(
+            std::env::var_os("HEX_REQUIRE_GPU").is_none(),
+            "recovery scene needs a GPU"
+        );
+        return;
+    };
+    let (width, height) = ((SIZE.0 * 2.0) as u32, (SIZE.1 * 2.0) as u32);
+    let pixels = offscreen::draw(&gpu, &mut rt, width, height);
+    assert!(
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel != &pixels[..4]),
+        "the recovery scene draws content"
+    );
+    if let Some(folder) = std::env::var_os("HEX_GOLDEN_RENDERS") {
+        let folder = std::path::PathBuf::from(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        rune::render::write_png(
+            &folder.join("history-recovery-native.png"),
+            width,
+            height,
+            &pixels,
+        )
+        .unwrap();
+    }
+}

@@ -980,3 +980,28 @@ consumer, without using the user's clipboard.
 Do not reset settings or loosen shortcut matching to make a recovery check pass.
 Keep automatic recovery, explicit retry, and defects that prevent recovery
 distinct. Test cleanup must preserve failure evidence.
+
+### Local shortcut safety copies (personal macOS)
+
+`recover.local-copy`: Labs → Recording recovery is off by default. Intentional
+shortcut captures can retain bounded, private audio and raw/final text even with
+History off. History → Recovery provides explicit replay, Copy, export, Keep,
+Resolve and Delete; turning the lab off preserves access to existing work.
+
+```ts
+intentional shortcut -> bounded recovery writer -> acknowledged audio checkpoints
+├── ASR -> saved raw text -> processing -> saved final text + delivery intent
+│   ├── native delivery reports success -> eligible for verified expiry
+│   └── failed/unconfirmed output -> unresolved safety copy
+└── interruption -> acknowledged prefix + explicit validated tail salvage
+    └── Retry locally -> loaded matching engine -> saved raw revision
+        └── no automatic paste, processing, download or History reconstruction
+```
+
+Ownership, bounds, retention, deletion and format are defined in
+[`docs/recording-recovery.md`](../recording-recovery.md); implementation entry
+points are `recovery`, `dictation/audio/recovery`, `parakeet/output` and
+`rune_ui/history/recovery`. Production-store crash tests, checksum/commit-error
+checks, capture admission tests, ordered output tests and a headless recovery
+scene exercise these paths. Native meeting protection is not implemented by
+this change. Consult the verification record for actual passing runs and limits.
