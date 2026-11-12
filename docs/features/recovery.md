@@ -1005,3 +1005,13 @@ points are `recovery`, `dictation/audio/recovery`, `parakeet/output` and
 checks, capture admission tests, ordered output tests and a headless recovery
 scene exercise these paths. Native meeting protection is not implemented by
 this change. Consult the verification record for actual passing runs and limits.
+
+
+Explicit retry after a transient capture fault can publish a recovered raw
+revision in the same process while stale live capture writes remain fenced.
+`explicit_retry_can_publish_after_capture_fault_without_reopening_live_writes`
+checks this with a real latched overflow, validated saved audio, restart and
+concurrent deletion. Commit-error fixtures also assert explicit replay cannot
+bypass an uncertain-commit fence. CLI request tests verify both export commands
+resolve relative destinations in the invoking process without creating files.
+These checks do not exercise native capture or a real target application's paste.

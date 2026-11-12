@@ -504,3 +504,67 @@ fn a_processing_failure_stays_unresolved_after_successful_fallback_delivery() {
     assert!(client.reader(id).unwrap().next().unwrap().is_some());
     client.shutdown().unwrap();
 }
+
+#[test]
+fn explicit_retry_can_publish_after_capture_fault_without_reopening_live_writes() {
+    let root = Root::new();
+    let client = Client::start(root.0.clone()).unwrap();
+    let session = client.begin(Default::default()).unwrap();
+    ready(&session);
+    session.offer(0, &[0.25; 16_000]).unwrap();
+    assert_eq!(client.list().unwrap().len(), 1);
+    assert_eq!(
+        session.offer(16_000, &[0.0; 16_001]),
+        Err(Failure::Overflow)
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let entries = client.list().unwrap();
+        if entries[0].snapshot.as_ref().unwrap().capture == CaptureState::Interrupted {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture fault must become observable"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let id = session.id().clone();
+    let mut reader = client.start_replay(id.clone()).unwrap();
+    let mut count = 0;
+    while let Some(samples) = reader.next().unwrap() {
+        count += samples.len();
+    }
+    assert_eq!(count, 16_000);
+    client
+        .finish_replay(
+            reader,
+            Default::default(),
+            Ok("recovered synthetic transcript".into()),
+        )
+        .unwrap();
+    assert_eq!(
+        client.text(id.clone(), true).unwrap(),
+        "recovered synthetic transcript"
+    );
+    assert!(session.offer(16_000, &[0.5; 100]).is_err());
+    assert!(session.save_raw("stale capture publication").is_err());
+    client.shutdown().unwrap();
+    let client = Client::start(root.0.clone()).unwrap();
+    assert_eq!(
+        client.text(id.clone(), true).unwrap(),
+        "recovered synthetic transcript"
+    );
+    let mut reader = client.start_replay(id.clone()).unwrap();
+    while reader.next().unwrap().is_some() {}
+    assert_eq!(client.delete(id.clone()), Err(Failure::Busy));
+    assert!(
+        client
+            .finish_replay(reader, Default::default(), Ok("deleted publication".into()))
+            .is_err()
+    );
+    client.shutdown().unwrap();
+    let reopened = Client::start(root.0.clone()).unwrap();
+    assert!(reopened.list().unwrap().is_empty());
+    reopened.shutdown().unwrap();
+}

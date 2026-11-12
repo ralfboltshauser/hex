@@ -591,6 +591,8 @@ removed `permissions.input_monitoring` from the status reply; version 3 removed
 `export-audio <id> <new-path>`, `export-text <id> <new-path> [--raw]`,
 `resolve <id> [--keep]`, and `delete <id> --yes` use the authenticated control
 surface. Retry never pastes, downloads or switches a model; exports never
-replace an existing file. Delete affects the safety copy and keeps its History
+replace an existing file. Relative export paths use the invoking shell's working
+directory and are sent as absolute paths; the destination need not exist.
+Delete affects the safety copy and keeps its History
 entry. The lab gates new captures; it does not gate access to saved work.
 Other OS hosts report `unsupported`. See [the recovery contract](recording-recovery.md).

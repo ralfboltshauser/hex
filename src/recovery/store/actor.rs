@@ -85,7 +85,7 @@ impl Store {
                 reply,
             } => {
                 let result = self
-                    .text(&id, text, raw, intent, None)
+                    .text(&id, text, raw, intent, TextSource::Capture)
                     .map_err(|error| classify(&error));
                 let _ = reply.send(result);
             }
@@ -166,7 +166,7 @@ impl Store {
                             manifest.snapshot.capture = CaptureState::Sealed;
                             manifest.snapshot.samples = reader.at;
                             manifest.snapshot.gap_count = reader.gaps;
-                            self.text(&id, text, true, false, Some(selection))
+                            self.text(&id, text, true, false, TextSource::Replay(selection))
                                 .map_err(|error| classify(&error))
                         }
                         result => {

@@ -35,6 +35,13 @@ pub struct Entry {
     pub bytes: u64,
 }
 
+// A failed capture remains fenced; an explicit validated replay can still
+// publish its own transcript without reopening the old capture generation.
+enum TextSource {
+    Capture,
+    Replay(TranscriptionSelection),
+}
+
 struct Stored {
     directory: Directory,
     manifest: Option<Manifest>,
@@ -503,7 +510,7 @@ impl Store {
         text: String,
         raw: bool,
         intent: bool,
-        selection: Option<TranscriptionSelection>,
+        source: TextSource,
     ) -> io::Result<()> {
         if text.len() > format::MAX_TEXT {
             return Err(io::Error::other("recovery text exceeds limit"));
@@ -518,12 +525,11 @@ impl Store {
             .sessions
             .get_mut(id)
             .ok_or_else(|| io::Error::other("session missing"))?;
-        if session.blocked
-            || session
-                .health
-                .as_ref()
-                .is_some_and(|health| health.fault.load(Ordering::Acquire) != 0)
-        {
+        let capture_fault = session
+            .health
+            .as_ref()
+            .is_some_and(|health| health.fault.load(Ordering::Acquire) != 0);
+        if session.blocked || (matches!(&source, TextSource::Capture) && capture_fault) {
             return Err(io::Error::other("capture persistence failed"));
         }
         let manifest = session
@@ -545,7 +551,10 @@ impl Store {
             samples: manifest.snapshot.samples,
             checksum: <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes()).into(),
             text,
-            selection: selection.unwrap_or_else(|| manifest.snapshot.selection.clone()),
+            selection: match source {
+                TextSource::Capture => manifest.snapshot.selection.clone(),
+                TextSource::Replay(selection) => selection,
+            },
         };
         let mut file = session.directory.file(&text_name(revision), true)?;
         self.files += 1;

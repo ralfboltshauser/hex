@@ -91,7 +91,9 @@ History → Recovery offers playback, raw/final text, Copy, local retry with the
 original or current model, native Save dialogs, Keep, Resolve and confirmed
 permanent deletion. Text preview is bounded; Copy uses the full loaded text.
 Exports create new owner-only files and refuse to overwrite an existing path.
-Export failure does not resolve or delete the source.
+Export failure does not resolve or delete the source. The CLI resolves relative
+export paths against the invoking shell's directory before transport; the new
+destination need not exist.
 
 `hex recovery list|text|retry|export-audio|export-text|resolve|delete` uses the
 existing authenticated `/control` transport. Delete requires `--yes`.
@@ -99,6 +101,10 @@ The additive control command is `{"command":"recovery","operation":...}`;
 operations use an `action` tag such as `{"action":"retry","id":"…",
 "current_model":false}`. Replies use the existing response envelope. Other
 platform hosts return `unsupported`.
+
+Explicit retry can publish recovered text after a transient capture fault without
+restarting Hex. The failed live capture remains fenced; deletion and uncertain
+commit failures still fence retry publication.
 
 Retry uses the loaded matching model on the existing transcription engine. It
 never downloads, switches or owns another model. It yields before engine work;

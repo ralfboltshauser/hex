@@ -336,3 +336,19 @@ tests; its only failure was the missing light reference, now collected. A final
 platform run with both committed references is required. The release will be
 marked prerelease while native shortcut/microphone/target-app acceptance remains
 unobserved; the installed app is not changed by this delivery.
+
+
+PR review identified two confirmed prepublication bugs: a latched capture fault
+also blocked explicit retry text publication, and relative CLI exports used the
+app's working directory. A new public-client regression reproduced the first
+failure before the fix (successful validated replay rejected with Storage).
+Text publication now distinguishes the fenced live capture from explicit replay;
+deletion and uncertain-commit fences remain shared. CLI request preparation
+resolves destinations to absolute paths before authenticated transport, without
+requiring the destination to exist. The initial focused check passed 21 tests;
+final clean-commit verification and packaging must be repeated for this revision.
+The earlier `caf7f9cd` archive/tag are superseded candidates, not a published release.
+
+The review-fix native suite passed **2,714 tests**, 37 excluded/ignored, with
+strict clippy, formatting, code-shape and Nix pins. The fork API currently lists
+only Check Linux; no automatic cross-platform Compile result is claimed.
