@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import zipfile
 
 
 PERSONAL_TEAM_ID = '76625SQ67N'
@@ -41,6 +42,21 @@ def digest(directory):
         elif path.is_file():
             result.update(path.read_bytes())
     return result.hexdigest()
+
+
+def archive_app(app, directory):
+    """Keep rollback bundles as archives so launchers cannot offer them as apps."""
+    directory.mkdir(parents=True, exist_ok=True)
+    archive = directory / f'{app.stem}-{uuid.uuid4().hex}.zip'
+    try:
+        run('ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(archive))
+        with zipfile.ZipFile(archive) as contents:
+            if contents.testzip() is not None:
+                raise RuntimeError('Backup archive failed its integrity check')
+    except BaseException:
+        archive.unlink(missing_ok=True)
+        raise
+    return archive
 
 
 class Fork:
@@ -206,15 +222,18 @@ class Fork:
         shutil.copytree(app, temporary, symlinks=True)
         self.validate_app(temporary)
         previous = None
+        rollback = destination.parent / f'.Hex-Ralf-{uuid.uuid4().hex}.backup'
         if destination.exists():
-            previous = destination.parent / f'Hex Ralf Backup-{uuid.uuid4().hex}.app'
-            destination.rename(previous)
+            previous = archive_app(destination, self.state / 'backups.noindex')
+            destination.rename(rollback)
         try:
             temporary.rename(destination)
         except BaseException:
             if previous:
-                previous.rename(destination)
+                rollback.rename(destination)
             raise
+        if rollback.exists():
+            shutil.rmtree(rollback)
         save(self.state / 'installed.json', dict(commit=commit, app=str(destination),
                                                previous=str(previous) if previous else None))
         print(f'Installed {destination}. Launch explicitly and check recording/transcription/paste.')

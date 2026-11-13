@@ -149,7 +149,9 @@ installation, schedule changes, or merging of unfinished features. Ambiguous
 replacement/removal of personal behavior still requires Ralf's decision.
 
 Installation targets only `~/Applications/Hex Ralf.app`, requires it to be closed,
-and retains any previous bundle alongside it. It does not launch either app,
+and retains the previous bundle as a ZIP in canonical
+`.hex-fork/backups.noindex/`, outside Applications so launchers do not list backups.
+It does not launch either app,
 change permissions, install the microphone driver, or copy official Hex data.
 Test microphone access, shortcut/cancel, transcription and paste in real target
 apps before daily use. Test isolation still requires one active recording owner;

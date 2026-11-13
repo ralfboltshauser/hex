@@ -116,6 +116,47 @@ class WorkflowTests(unittest.TestCase):
                 with fork.lock():
                     self.fail('second writer entered')
 
+    def test_install_archives_previous_app_outside_applications(self):
+        home = self.directory / 'home'
+        destination = home / 'Applications/Hex Ralf.app'
+        destination.mkdir(parents=True)
+        (destination / 'version').write_text('old')
+        app = self.directory / 'candidate.app'
+        app.mkdir()
+        (app / 'version').write_text('new')
+        original_run = maintain.run
+        original_rename = Path.rename
+
+        def fail_replacement(path, target):
+            if path.name.startswith('.Hex-Ralf-') and path.suffix == '.app':
+                raise OSError('replacement failed')
+            return original_rename(path, target)
+
+        with patch.object(Path, 'home', return_value=home), \
+                patch.object(self.fork, 'verified', return_value='commit'), \
+                patch.object(self.fork, 'artifact', return_value=app), \
+                patch.object(self.fork, 'validate_app'), \
+                patch.object(maintain, 'run', wraps=maintain.run) as command:
+            command.side_effect = lambda *args, **kwargs: '' if args[0] == 'ps' else original_run(*args, **kwargs)
+            with patch.object(Path, 'rename', fail_replacement):
+                with self.assertRaisesRegex(OSError, 'replacement failed'):
+                    self.fork.install()
+            self.assertEqual((destination / 'version').read_text(), 'old')
+            # Remove only the staged test candidate left by the failed replacement.
+            for staged in destination.parent.glob('.Hex-Ralf-*.app'):
+                import shutil
+                shutil.rmtree(staged)
+            self.fork.install()
+        receipt = json.loads((self.fork.state / 'installed.json').read_text())
+        archive = Path(receipt['previous'])
+        self.assertEqual(archive.parent, self.fork.state / 'backups.noindex')
+        restored = self.directory / 'restored'
+        maintain.run('ditto', '-x', '-k', str(archive), str(restored))
+        self.assertEqual((restored / 'Hex Ralf.app/version').read_text(), 'old')
+        self.assertEqual((destination / 'version').read_text(), 'new')
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
+        self.assertFalse(list(archive.parent.glob('*.backup')))
+
     def test_artifact_digest_detects_bytes_paths_and_symlink_changes(self):
         app = self.directory / 'Test.app'
         app.mkdir()
