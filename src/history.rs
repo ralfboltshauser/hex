@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 pub mod captures;
 pub mod playback;
 pub mod recordings;
+#[cfg(target_os = "macos")]
+mod recovery;
 pub mod stats;
 pub mod versions;
 
@@ -106,12 +108,17 @@ pub type HistoryProcessing = crate::desktop::events::DictationProcessing;
 /// One retained successful result.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct HistoryEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<String>,
+    /// Native delivery reported success/failure; None retains legacy semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_reported: Option<bool>,
     pub id: u64,
     pub timestamp_ms: u64,
     pub kind: HistoryKind,
     /// Corrected local transcript before mode processing.
     pub raw_text: String,
-    /// Text that was actually inserted.
+    /// Final text; `delivery_reported` distinguishes protected failed output.
     pub final_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application: Option<String>,
@@ -390,6 +397,23 @@ impl HistoryStore {
     /// Record one successful result. Returns the stable entry ID, or `None`
     /// while retention is off.
     pub fn record(&mut self, draft: HistoryDraft, now_ms: u64) -> io::Result<Option<u64>> {
+        self.record_correlated(draft, None, None, now_ms)
+    }
+    pub fn record_correlated(
+        &mut self,
+        draft: HistoryDraft,
+        recovery_id: Option<String>,
+        delivery_reported: Option<bool>,
+        now_ms: u64,
+    ) -> io::Result<Option<u64>> {
+        if let Some(id) = &recovery_id
+            && let Some(entry) = self
+                .entries
+                .iter()
+                .find(|entry| entry.recovery_id.as_ref() == Some(id))
+        {
+            return Ok(Some(entry.id));
+        }
         if self.retention.is_off() {
             return Ok(None);
         }
@@ -402,6 +426,8 @@ impl HistoryStore {
             })
         });
         self.entries.push(HistoryEntry {
+            recovery_id,
+            delivery_reported,
             id,
             timestamp_ms: now_ms,
             kind: draft.kind,
@@ -653,6 +679,9 @@ impl HistoryStore {
             file.sync_all()?;
         }
         fs::rename(&temporary, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            crate::durable::sync_directory(parent)?;
+        }
         self.file_state = file_state(&self.path);
         self.prune_pending = false;
         self.prune_error_reported = false;
@@ -677,6 +706,8 @@ impl HistoryStore {
 /// Thread-safe shared handle over one history store.
 #[derive(Clone)]
 pub struct History {
+    #[cfg(target_os = "macos")]
+    recovery: Arc<Mutex<Option<crate::recovery::Client>>>,
     store: Arc<Mutex<HistoryStore>>,
     // Only handles own senders: dropping the last clone wakes and stops the worker.
     _shutdown: mpsc::Sender<()>,
@@ -711,6 +742,8 @@ impl History {
             tracing::warn!(%error, "could not start history retention worker");
         }
         Self {
+            #[cfg(target_os = "macos")]
+            recovery: Arc::new(Mutex::new(None)),
             store,
             _shutdown: shutdown,
         }
@@ -725,12 +758,68 @@ impl History {
     pub fn record(&self, draft: HistoryDraft) -> io::Result<Option<u64>> {
         self.synced().record(draft, now_ms())
     }
+    #[cfg(target_os = "macos")]
+    pub fn record_correlated(
+        &self,
+        draft: HistoryDraft,
+        recovery_id: Option<String>,
+        delivered: Option<bool>,
+    ) -> io::Result<Option<u64>> {
+        if recovery_id.is_none() && delivered.is_none() {
+            return self.record(draft);
+        }
+        self.synced()
+            .record_correlated(draft, recovery_id, delivered, now_ms())
+    }
 
     pub fn delete(&self, id: u64) -> io::Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            let safety = self
+                .synced()
+                .entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .and_then(|entry| entry.recovery_id.clone());
+            self.delete_safety_copies(safety.into_iter().collect())?;
+        }
         self.synced().delete(id)
     }
 
     pub fn clear(&self) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            // Capture the confirmation's scope, then release History's lock
+            // while the disk owner acknowledges associated deletion intents.
+            let (scope, safety) = {
+                let store = self.synced();
+                (
+                    store
+                        .entries
+                        .iter()
+                        .map(|entry| entry.id)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    store
+                        .entries
+                        .iter()
+                        .filter_map(|entry| entry.recovery_id.clone())
+                        .collect(),
+                )
+            };
+            self.delete_safety_copies(safety)?;
+            let mut store = self.synced();
+            if store.entries.iter().all(|entry| scope.contains(&entry.id)) {
+                return store.clear();
+            }
+            let previous = store.entries.clone();
+            store.entries.retain(|entry| !scope.contains(&entry.id));
+            if let Err(error) = store.persist() {
+                store.entries = previous;
+                return Err(error);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
         self.synced().clear()
     }
 
@@ -969,6 +1058,8 @@ mod tests {
         // The entry cap takes the oldest entry's audio with it.
         store.entries = (0..MAX_ENTRIES + 1)
             .map(|offset| HistoryEntry {
+                recovery_id: None,
+                delivery_reported: None,
                 id: kept + offset as u64,
                 ..store.entries[0].clone()
             })
@@ -1377,6 +1468,8 @@ mod tests {
         store.record(draft("entry"), 0).unwrap();
         store.entries = (0..MAX_ENTRIES + 5)
             .map(|id| HistoryEntry {
+                recovery_id: None,
+                delivery_reported: None,
                 id: id as u64,
                 ..store.entries[0].clone()
             })
@@ -1401,6 +1494,8 @@ mod tests {
         store.record(draft(&big), 0).unwrap();
         store.entries = (0..fits + 3)
             .map(|id| HistoryEntry {
+                recovery_id: None,
+                delivery_reported: None,
                 id: id as u64,
                 ..store.entries[0].clone()
             })

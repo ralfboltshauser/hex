@@ -66,6 +66,12 @@ impl Pump {
             Err(command) => command,
         };
         match command {
+            ControlCommand::Recovery { operation: command } => {
+                background(reply, move || {
+                    Ok(crate::recovery::execute(&runtime.recovery(), command))
+                });
+                None
+            }
             ControlCommand::Status => {
                 let meeting = meeting_report(&self.meeting_state);
                 let window = self.window.clone();
@@ -288,7 +294,10 @@ impl Pump {
                 background(reply, move || restart_onboarding(&window));
                 None
             }
-            ControlCommand::HistoryClear => Some(reply_with(clear_history(&runtime))),
+            ControlCommand::HistoryClear => {
+                background(reply, move || clear_history(&runtime));
+                None
+            }
             ControlCommand::LaunchAtLogin { enabled } => {
                 background(reply, move || launch_at_login(enabled));
                 None

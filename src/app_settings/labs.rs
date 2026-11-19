@@ -135,6 +135,8 @@ pub struct LabsSettings {
     pub section_key_alone: bool,
     /// Dictations saved to History keep their audio, for Transcribe again (issue 1032).
     pub keep_recordings: bool,
+    /// Temporary local safety copies of intentional shortcut dictations (macOS).
+    pub recording_recovery: bool,
     /// General's pane starts with a search field that filters its rows.
     pub settings_search: bool,
     /// The sidebar footer links this build's release notes.
@@ -260,6 +262,7 @@ impl Default for LabsSettings {
             picker_downloaded: false,
             section_key_alone: false,
             keep_recordings: false,
+            recording_recovery: false,
             settings_search: false,
             release_notes_link: false,
             hide_menu_bar_icon: false,

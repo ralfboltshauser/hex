@@ -444,6 +444,11 @@ pub(super) const KEYS: &[Key] = &[
         "Labs: a shortcut may be the § key, left of 1 on ISO keyboards, with no modifier (Linux); off puts such a shortcut back to its default",
     ),
     key(
+        "labs.recording_recovery",
+        Kind::Bool,
+        "Labs: retain temporary local safety copies of shortcut dictations on macOS, including when History is off; disabling keeps existing recovery items",
+    ),
+    key(
         "labs.keep_recordings",
         Kind::Bool,
         "Labs: dictations saved to History keep their audio, so History can transcribe them again with another model; off stops saving, clearing History deletes it",

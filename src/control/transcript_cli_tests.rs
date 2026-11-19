@@ -117,6 +117,8 @@ fn history_stats_parse_sum_retained_entries_and_need_the_labs_toggle() {
     ));
     const DAY: u64 = 86_400_000;
     let entry = |id: u64, age_days: u64, raw: &str, final_text: &str| HistoryEntry {
+        recovery_id: None,
+        delivery_reported: None,
         id,
         timestamp_ms: NOW - age_days * DAY,
         kind: HistoryKind::Dictation,
@@ -167,6 +169,8 @@ fn history_stats_parse_sum_retained_entries_and_need_the_labs_toggle() {
 fn history_search_ranks_fuzzy_stemmed_matches_within_retention() {
     let mut entries = entries();
     entries.push(HistoryEntry {
+        recovery_id: None,
+        delivery_reported: None,
         id: 5,
         timestamp_ms: 1_792_650_000_000,
         final_text: "Board games tonight.".into(),
@@ -224,6 +228,8 @@ fn history_search_ranks_fuzzy_stemmed_matches_within_retention() {
 fn history_search_counts_raw_and_final_text_as_one_document() {
     let template = entries()[2].clone();
     let entry = |id: u64, final_text: &str, raw_text: &str| HistoryEntry {
+        recovery_id: None,
+        delivery_reported: None,
         id,
         timestamp_ms: NOW - id * 1_000,
         final_text: final_text.into(),

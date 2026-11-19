@@ -77,6 +77,11 @@ pub(super) const SCENES: &[Scene] = &[
         ui.history = history::HistoryPane::fixture();
         ui.pane = Pane::History;
     }),
+    ("history-recovery", |ui| {
+        *ui = portal_fixture();
+        ui.history = history::HistoryPane::recovery_fixture();
+        ui.pane = Pane::History;
+    }),
     ("history-menu", |ui| {
         *ui = portal_fixture();
         ui.history = history::HistoryPane::fixture();

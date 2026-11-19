@@ -61,6 +61,8 @@ mod personal_commands;
 mod policy;
 #[cfg(target_os = "macos")]
 mod recognition;
+#[cfg(target_os = "macos")]
+mod recovery;
 mod rune_hud;
 mod rune_ui;
 #[cfg(all(target_os = "macos", hex_capture))]
@@ -418,9 +420,16 @@ fn main() -> Result<()> {
                 device.as_deref(),
                 &SHUTDOWN,
                 None,
-                history,
                 None,
-                std::sync::Arc::new(personal_commands::TransformationClient::default()),
+                recognition::Services {
+                    history,
+                    transformations: std::sync::Arc::new(
+                        personal_commands::TransformationClient::default(),
+                    ),
+                    recovery: recovery::Client::start(
+                        app_paths::support_dir()?.join("dictation-recovery"),
+                    )?,
+                },
             )
         }
         Command::Service { embedded } => {

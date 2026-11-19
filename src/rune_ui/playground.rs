@@ -189,6 +189,7 @@ const PATHS: &[(&str, &str)] = &[
         "Window/Meetings/Calendar denied",
     ),
     ("history", "Window/History/History"),
+    ("history-recovery", "Window/History/Recovery"),
     ("history-menu", "Window/History/Retention menu"),
     ("history-clear", "Window/History/Clear all asks first"),
     ("history-stats", "Window/History/Stats dialog"),

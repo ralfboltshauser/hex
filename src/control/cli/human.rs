@@ -26,6 +26,14 @@ pub(crate) fn print(reply: ControlReply, output: Output) -> u8 {
         ControlReply::Status(report) => print!("{}", human_status(&report)),
         ControlReply::Settings { settings } => print!("{}", human_settings(&settings)),
         ControlReply::Models { models } => print!("{}", human_models(&models)),
+        ControlReply::Recovery { entries } => {
+            for entry in entries {
+                println!(
+                    "{}  {}  {} ms  {} bytes",
+                    entry.id, entry.capture, entry.saved_audio_ms, entry.bytes
+                );
+            }
+        }
         ControlReply::Vocabulary { entries } => print!("{}", human_vocabulary(&entries)),
         ControlReply::ScrawlCapture(report) => print!("{}", human_scrawl_capture(&report)),
         ControlReply::ScrawlCaptures { captures } => print!("{}", human_captures(&captures)),

@@ -15,6 +15,7 @@ mod labs;
 mod meetings;
 mod onboarding;
 mod portuguese;
+mod recovery;
 mod russian;
 mod text_language;
 mod traditional_chinese;
@@ -348,6 +349,7 @@ pub(super) fn all_translations() -> impl Iterator<Item = &'static (&'static str,
         .iter()
         .chain(meetings::TRANSLATIONS)
         .chain(labs::TRANSLATIONS)
+        .chain(recovery::TRANSLATIONS)
         .chain(failures::TRANSLATIONS)
         .chain(onboarding::TRANSLATIONS)
 }
@@ -1637,6 +1639,7 @@ mod tests {
         include_str!("../rune_ui/general/extra_shortcuts.rs"),
         include_str!("../rune_ui/general/search.rs"),
         include_str!("../rune_ui/history.rs"),
+        include_str!("../rune_ui/history/recovery.rs"),
         include_str!("../rune_ui/hud_lab.rs"),
         include_str!("../rune_ui/labs.rs"),
         include_str!("../rune_ui/labs/group.rs"),

@@ -12,6 +12,7 @@ pub(crate) mod dashboard;
 pub(crate) mod developer_control;
 #[cfg(not(target_os = "macos"))]
 pub(crate) mod host;
+pub mod recovery;
 pub mod settings;
 pub(crate) mod transcript_cli;
 
@@ -78,6 +79,9 @@ pub enum Pane {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
 pub enum ControlCommand {
+    Recovery {
+        operation: recovery::RecoveryCommand,
+    },
     Status,
     Quit {
         #[serde(default)]
@@ -224,6 +228,9 @@ impl ControlRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum ControlReply {
+    Recovery {
+        entries: Vec<recovery::RecoverySummary>,
+    },
     /// The command ran. `changed` is false when it was already so.
     Done {
         message: String,

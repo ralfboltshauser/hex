@@ -583,3 +583,16 @@ removed `permissions.input_monitoring` from the status reply; version 3 removed
 `voice-action` and `features.voice_action`; version 4 removed `commands-retry`,
 `settings-set.confirm`, `window-show` `commands`, `capture.recording` `voice`,
 `features.commands`, and `features.command_model`.
+
+### Personal macOS recording recovery
+
+`hex recovery list` reads safety-copy metadata from the running app.
+`text <id> [--raw]`, `retry <id> [--current-model]`,
+`export-audio <id> <new-path>`, `export-text <id> <new-path> [--raw]`,
+`resolve <id> [--keep]`, and `delete <id> --yes` use the authenticated control
+surface. Retry never pastes, downloads or switches a model; exports never
+replace an existing file. Relative export paths use the invoking shell's working
+directory and are sent as absolute paths; the destination need not exist.
+Delete affects the safety copy and keeps its History
+entry. The lab gates new captures; it does not gate access to saved work.
+Other OS hosts report `unsupported`. See [the recovery contract](recording-recovery.md).

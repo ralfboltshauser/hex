@@ -2785,3 +2785,10 @@ Checks: `labs_is_one_flat_list_of_toggles_off_by_default`,
 [control/settings.rs](../../src/control/settings.rs). Passed on Linux on
 2026-10-30; the macOS build was not checked, and the Windows build was
 type-checked only.
+
+The personal macOS **Recording recovery** lab (`labs.recording_recovery`) is off
+by default. It keeps temporary private safety copies of intentional shortcut
+dictations independently of History retention. Existing copies remain accessible
+through History → Recovery while the lab is off. See
+[local recovery](recovery.md#local-shortcut-safety-copies-personal-macos) for
+failure behavior, cleanup, explicit deletion and verification limits.

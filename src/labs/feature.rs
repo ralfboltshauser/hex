@@ -48,6 +48,7 @@ pub enum Feature {
     PickerDownloaded,
     SectionKeyAlone,
     KeepRecordings,
+    RecordingRecovery,
     SettingsSearch,
     Appearance,
     ReleaseNotesLink,
@@ -80,7 +81,7 @@ pub enum Feature {
 }
 
 impl Feature {
-    pub const ALL: [Self; 72] = [
+    pub const ALL: [Self; 73] = [
         Self::Meetings,
         Self::VoiceFilter,
         Self::Playground,
@@ -124,6 +125,7 @@ impl Feature {
         Self::PickerDownloaded,
         Self::SectionKeyAlone,
         Self::KeepRecordings,
+        Self::RecordingRecovery,
         Self::SettingsSearch,
         Self::Appearance,
         Self::ReleaseNotesLink,

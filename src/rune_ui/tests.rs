@@ -2938,6 +2938,7 @@ fn goldens() {
 
 mod onboarding_check;
 mod panes;
+mod recovery;
 
 /// Rune hands focus back to a menu's trigger when it closes. A key the
 /// window means for something else must not reach that trigger.

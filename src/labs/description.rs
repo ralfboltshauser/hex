@@ -13,6 +13,9 @@ impl Feature {
                 "Hex Microphone virtual input and real-time voice filters (its own pane)"
             }
             Self::Playground => "Scene and story browser in the window",
+            Self::RecordingRecovery => {
+                "Keep temporary local audio and text for shortcut dictation recovery, even with History off"
+            }
             Self::LiveText => "Show provisional words beside the HUD while dictating",
             Self::FailureNotices => "Show why a dictation failed beside the HUD",
             Self::LiveTyping => {

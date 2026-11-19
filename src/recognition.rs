@@ -29,6 +29,10 @@ mod context_watch;
 mod guards;
 mod hotkeys;
 mod output;
+mod programmatic;
+use programmatic::{
+    cancel_programmatic_capture, log_programmatic_ended, programmatic_microphone_lost,
+};
 
 use context_watch::ContextWatch;
 use guards::{
@@ -166,15 +170,28 @@ impl FinishingProgrammaticDictation {
     }
 }
 
+pub struct Services {
+    pub history: Option<crate::history::History>,
+    pub transformations: Arc<crate::personal_commands::TransformationClient>,
+    pub recovery: crate::recovery::Client,
+}
+
 pub fn listen(
     events: EventLog,
     device_override: Option<&str>,
     shutdown: &AtomicBool,
     indicator: Option<DictationIndicatorSender>,
-    history: Option<crate::history::History>,
     controls: Option<Receiver<RecognitionControl>>,
-    transformations: Arc<crate::personal_commands::TransformationClient>,
+    services: Services,
 ) -> Result<()> {
+    let Services {
+        history,
+        transformations,
+        recovery,
+    } = services;
+    if let Some(history) = &history {
+        history.attach_recovery(recovery.clone());
+    }
     shutdown.store(false, Ordering::Relaxed);
     // Feedback admission is advisory: a cold audio stack can exceed the
     // preload timeout, and missing tones must not stop desktop recognition.
@@ -222,6 +239,7 @@ pub fn listen(
         microphone_policy.release_while_idle,
         dictation_worker.engine(),
     )?;
+    input.configure_recovery(recovery)?;
     #[cfg(hex_capture)]
     let mut capture_host =
         crate::capture_host::CaptureHost::start(dictation_worker.engine(), &capture_environment);
@@ -967,6 +985,13 @@ pub fn listen(
 
         while let Some(audio_event) = input.try_recv_event() {
             match audio_event {
+                DictationAudioEvent::ProtectionFailed => {
+                    hotkeys.suspend_all();
+                    fail_capture(
+                        "Recording stopped because its local safety copy could not be saved. Open History recovery to inspect saved work.".into(),
+                        &dictation_worker, &input.device_name(), &mut events, indicator,
+                    )?;
+                }
                 DictationAudioEvent::ReadyIntentional { .. } => {
                     // A released microphone opened after the press already
                     // counted as intentional: read this capture's page now.
@@ -1111,93 +1136,6 @@ pub fn listen(
     })?;
     events.flush()?;
     indicator.send(DictationIndicatorEvent::Discarded);
-    Ok(())
-}
-
-fn log_programmatic_ended(active: Option<ProgrammaticDictation>, outcome: &str) {
-    if let Some(active) = active {
-        tracing::warn!(
-            dictation_id = active.id,
-            source = active.source,
-            outcome,
-            "programmatic dictation ended"
-        );
-    }
-}
-
-/// Ends a programmatic capture the microphone cut short. The audio delivered
-/// before the loss waits for the owner's `/finish`; without any, `/finish`
-/// answers `microphone-lost`.
-fn programmatic_microphone_lost(
-    active: Option<ProgrammaticDictation>,
-    kept: Option<DictationClip>,
-    outcome: &str,
-    lost: &mut Option<LostProgrammaticDictation>,
-    completions: &mut VecDeque<Completion>,
-) {
-    let Some(active) = active else {
-        return;
-    };
-    let Some(mut clip) = kept else {
-        remember_completion(
-            completions,
-            Completion {
-                id: active.id,
-                owner_token: active.owner_token.clone(),
-                outcome: TerminalOutcome::Finished(Err(MICROPHONE_LOST.into())),
-            },
-        );
-        log_programmatic_ended(Some(active), outcome);
-        return;
-    };
-    // A held clip must not defer background work until the owner finishes.
-    drop(clip.take_capture_marker());
-    tracing::warn!(
-        dictation_id = active.id,
-        source = active.source,
-        outcome,
-        duration_ms = clip.duration_ms(),
-        "programmatic dictation kept its audio after a microphone loss"
-    );
-    let previous = lost.replace(LostProgrammaticDictation {
-        id: active.id,
-        owner_token: active.owner_token,
-        source: active.source,
-        lease_deadline: active.lease_deadline,
-        clip,
-    });
-    if let Some(previous) = previous {
-        tracing::warn!(
-            dictation_id = previous.id,
-            source = previous.source,
-            outcome = "superseded",
-            "programmatic dictation ended"
-        );
-        remember_completion(
-            completions,
-            Completion {
-                id: previous.id,
-                owner_token: previous.owner_token,
-                outcome: TerminalOutcome::Finished(Err(MICROPHONE_LOST.into())),
-            },
-        );
-    }
-}
-
-fn cancel_programmatic_capture(
-    active: ProgrammaticDictation,
-    input: &DictationAudio,
-    completions: &mut VecDeque<Completion>,
-) -> Result<()> {
-    input.cancel()?;
-    remember_completion(
-        completions,
-        Completion {
-            id: active.id,
-            owner_token: active.owner_token,
-            outcome: TerminalOutcome::Cancelled,
-        },
-    );
     Ok(())
 }
 
