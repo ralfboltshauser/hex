@@ -1998,19 +1998,38 @@ another application's fullscreen Space (#75); panel style flags on an ordinary
 `NSWindow` were not sufficient.
 
 Each time the HUD shows, Rune clears and resets those collection behaviors
-before ordering the panel in, and orders it out first if it is still shown on
-another Space (#1084). Changing the activation policy (the Dock icon follows
-Settings) could leave the panel tied to one Space while AppKit still reported
-the old mask, and re-setting an unchanged mask does nothing. Rune repairs that
-only as its panel shows, so while the HUD is shown Hex also checks each pump
-turn that the panel is on the active Space, and re-homes it when a Space switch
-or a full-screen exit left it behind: it orders the panel out, clears and
-restores the mask, and orders it back in. That reorders the panel but leaves
-Rune's presence state and alpha alone. It is attempted once per show, and once
-more for each later Space change after the panel has been seen on the active
-Space, so a repair that did not take cannot loop. The live-text plate beside
-the HUD is a separate panel and does not get this repair yet. Not yet observed
-on hardware; only the macOS compile is checked.
+before ordering the panel in (#1084). In Ralf's fork, a macOS hide releases the
+native panel and surface, so the next capture creates a fresh panel instead of
+inheriting a stranded one. The GPU device and painter can still be reused.
+Every capture start asks Rune to show it, even if Hex remembers requesting a
+show earlier (the upstream #1888 behavior, applied to macOS).
+
+While Hex wants the HUD shown, the pump checks the actual native panel's
+visibility, active Space, and alpha. After 300 ms of missing visibility it
+orders the panel out, clears and reasserts the intended collection behaviors,
+and orders it back in. If that still fails after another 300 ms, it releases
+the native panel and surface and shows a replacement on a subsequent event-loop
+turn, preserving the indicator model and recording. One persistent failure gets
+one replacement; a new capture or a full second of healthy visibility permits
+recovery from a later failure. Hidden and Reset never get overridden by recovery.
+This does not restart Hex, activate another application, or change microphone,
+transcription, or paste ownership. Live text is a separate panel and is not
+covered by this recovery.
+
+**Observed November 19, 2026:** the installed 3.4.0 build reported recording
+while CoreGraphics reported no onscreen HUD, twice after a two-second wait;
+the native panel remained on a different Space after its old repair. Restarting
+restored visibility. The initiating macOS transition is still unidentified.
+The isolated debug-app native regression (`scripts/personal/check_hud_recovery.py`,
+invoked through `scripts/personal/check.sh`) failed before the fix and passed
+afterward: a deliberately unshowable panel was replaced without restarting,
+another loss in the same synthetic recording recovered, Reset during recovery
+stayed hidden, eight new show/hide cycles used fresh panels, and Hidden stayed
+hidden. These tests use real AppKit/Rune windows and synthetic indicator states,
+not live microphone capture or paste. `rune_hud::recovery::tests` covers the
+timing/budget policy; `dictation::indicator` covers the indicator's normal and
+cancellation transitions. Long-running real-world Space/fullscreen/display
+changes with the updated installed app still need observation.
 
 At the top position the HUD sits 6 pt below the menu bar (`rune_hud::hud_placement::TOP_OFFSET`), or below the
 notch (`NSScreen.safeAreaInsets`) where a fullscreen Space hides the menu bar

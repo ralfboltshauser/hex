@@ -29,6 +29,24 @@ reversal/cancellation and ordinary dictation when the feature affects them.
 
 ## Intentional differences
 
+The macOS dictation HUD must recover when AppKit loses its native panel. On
+November 19, 2026 the installed build repeatedly recorded with no onscreen HUD,
+and reordering its retained panel failed until Hex restarted. The initiating
+Space/display transition is not yet identified. The fork releases the HUD's
+native window and surface on hide, re-asks Rune at each capture start (the
+macOS behavior of upstream #1888), and replaces a panel when a bounded native
+visibility check and rehome fail. Recording/model/paste state is preserved;
+Hidden and Reset remain authoritative. `src/rune_hud/recovery.rs` owns the
+timing/budget policy; `rune_hud/macos.rs` observes AppKit; `rune_hud.rs` uses
+Rune's existing zero-delay release and separate hide/show turns. This changes
+the HUD's native lifetime, with some window/surface creation work on each
+capture; its painter/device can still be reused. Upstream #1730 and #1888 are
+relevant future integration points, not merged dependencies. The debug-only
+`hex dev hud hide-native` fault keeps one panel unshowable without recording
+audio. Focused policy/indicator checks and the optional isolated native GUI
+regression are registered in `scripts/personal/check.sh`. The feature map records
+observed checks and the remaining long-running native verification gap.
+
 Personal builds are named **Hex Ralf** in Finder and the macOS application and
 Quit menus. `maintain.py` sets `HEX_PERSONAL_BUILD=1`; the test-build packaging
 branch in `scripts/build-app.sh` and `src/app_paths.rs::app_name` use it. Ordinary

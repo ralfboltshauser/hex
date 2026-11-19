@@ -17,6 +17,8 @@ pub(crate) mod dot_scope;
 pub(crate) mod hud_placement;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod recovery;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::pointer_screen;
 pub(crate) mod spring;
@@ -330,6 +332,10 @@ pub(crate) struct Hud {
     animating: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
     placed: Option<crate::rune_hud::hud_placement::Placed>,
+    /// Prevent a normal show from coalescing away the recovery hide. Rune
+    /// must release the old window before the next event-loop turn shows it.
+    #[cfg(target_os = "macos")]
+    recovering: bool,
     /// The position the overlay was last placed for, while it stays on that
     /// display; a capture's start or a hide picks the display again.
     #[cfg(not(target_os = "macos"))]
@@ -379,13 +385,11 @@ impl Hud {
         if matches!(&event, HudEvent::Started) {
             self.edge_placed = None;
         }
-        // Rune drops an overlay whose layer surface the compositor closed,
-        // which it does when the HUD's output goes away (a monitor
-        // unplugged, or a KVM switching away and back, #1663), without
-        // telling Hex: ask Rune for the HUD at each capture's start, so a
-        // later one appears on an output that exists. Rune's show is a no-op
-        // while the overlay is visible.
-        #[cfg(target_os = "linux")]
+        // `shown` records Hex's request, not Rune's native state. A lost
+        // surface can hide the overlay without updating this flag. Re-ask
+        // at every capture start (#1663, upstream #1888); Rune ignores a
+        // redundant show while it is already visible.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if matches!(&event, HudEvent::Started) {
             self.shown.store(false, Ordering::Release);
         }
@@ -423,6 +427,9 @@ impl Hud {
                 let plate_start = TOP_OFFSET + (WINDOW.1 - PLATE_HEIGHT) / 2.0;
                 set_live_text(Spot::Edge(ScreenEdge::Top, plate_start));
             }
+            // A start has cleared `shown`; the native overlay may still be
+            // up. An unconditional hide preserves the Hidden setting.
+            overlay.hide();
             self.hide();
             return;
         }
@@ -446,9 +453,42 @@ impl Hud {
             set_live_text(Spot::Edge(edge, past_plate));
         }
         if !self.shown.load(Ordering::Acquire) {
-            overlay.show();
+            #[cfg(target_os = "macos")]
+            let reveal = !self.recovering;
+            #[cfg(not(target_os = "macos"))]
+            let reveal = true;
+            if reveal {
+                overlay.show();
+            }
             self.shown.store(true, Ordering::Release);
         }
+    }
+
+    /// A native panel that reordering did not recover must be released,
+    /// rather than left invisible until the person restarts Hex. Queue the
+    /// reveal from the update accompanying the hide: Rune snapshots requests
+    /// before running updates, so these reach two different event-loop turns.
+    #[cfg(target_os = "macos")]
+    fn recreate_native(&mut self) {
+        let Some(overlay) = self.this.clone() else {
+            return;
+        };
+        if self.recovering || !self.shown.load(Ordering::Acquire) {
+            return;
+        }
+        self.recovering = true;
+        overlay.hide();
+        overlay.update_if(|hud, _| {
+            hud.recovering = false;
+            // Reset/Hidden can arrive while the old panel is being released.
+            // Recheck both the intent and the model before showing anything.
+            if hud.shown.load(Ordering::Acquire) && hud.model.active() {
+                hud.unplace();
+                hud.shown.store(false, Ordering::Release);
+                hud.show();
+            }
+            false
+        });
     }
 
     /// Hides the overlay once its exit has settled, fading the window out
@@ -505,10 +545,11 @@ const EXIT_FADE: Duration = Duration::from_millis(120);
 /// the next show either way, so dictations reuse one device (#1268). The
 /// painter goes once Rune's parked device would also have gone, which is this
 /// plus the five minutes Rune parks a device (`PAINTER_IDLE`, #1431); macOS
-/// keeps it.
-#[cfg(not(target_os = "windows"))]
+/// keeps the painter but releases the native panel on every hide, so a
+/// later capture cannot inherit a window stranded by AppKit.
+#[cfg(target_os = "linux")]
 const GPU_IDLE: Duration = Duration::from_secs(5 * 60);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 const GPU_IDLE: Duration = Duration::ZERO;
 
 /// How long the hidden HUD keeps its painter on Windows and Linux, and with it
@@ -582,9 +623,9 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) -> HudSender {
             view,
         }
         .options(OverlayOptions {
-            // The first press never waits on the window: macOS keeps the
-            // panel drawn at alpha zero; elsewhere only the window waits,
-            // and its GPU surface comes with the show (`release_gpu_after`).
+            // Linux prewarms its window; Windows and macOS make a fresh
+            // native window on show (`GPU_IDLE` is zero there). The device
+            // and painter can still be reused between dictations.
             prewarm: true,
             #[cfg(not(target_os = "macos"))]
             display: display(),
@@ -592,8 +633,8 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) -> HudSender {
         })
         // The shaders write display (sRGB-encoded) values.
         .srgb_blend(true)
-        // On Linux a burst of dictations keeps the GPU surface, so each HUD
-        // shows at once; a Hex at rest gives the GPU device back.
+        // Linux keeps the surface through bursts. macOS releases the native
+        // panel too, both on ordinary hides and on a recovery hide.
         .release_gpu_after(GPU_IDLE)
         .compositor(HudCompositor {
             #[cfg(not(target_os = "macos"))]
@@ -613,6 +654,8 @@ pub(crate) fn install<S: 'static>(app: &mut rune::App<S>) -> HudSender {
             animating: animating.clone(),
             #[cfg(target_os = "macos")]
             placed: None,
+            #[cfg(target_os = "macos")]
+            recovering: false,
             #[cfg(not(target_os = "macos"))]
             edge_placed: None,
             #[cfg(not(target_os = "macos"))]

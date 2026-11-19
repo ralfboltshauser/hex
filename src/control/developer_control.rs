@@ -9,6 +9,9 @@ pub enum DeveloperHudState {
     Recording,
     Transcribing,
     Processing,
+    /// Fault injection: lose the native panel without changing the HUD model.
+    #[cfg(debug_assertions)]
+    HideNative,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]

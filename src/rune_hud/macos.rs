@@ -3,6 +3,7 @@
 //! metrics. The main thread's pump hands it the listener's events.
 
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
@@ -15,6 +16,7 @@ use rune::{DisplayTarget, OverlayHandle, OverlayPlacement};
 use super::{Hud, HudEvent, HudSender, LIVE_TEXT_GAP, WINDOW, set_live_text};
 use crate::app_settings::IndicatorPosition;
 use crate::rune_hud::hud_placement;
+use crate::rune_hud::recovery::{Action, Recovery};
 use crate::rune_ui::live_text::Spot;
 
 /// `NSStatusWindowLevel`: over other apps' windows, under the menu bar.
@@ -119,11 +121,10 @@ pub(crate) struct DictationIndicatorUi {
     /// The HUD's panel and the window number it had when found: Rune makes a
     /// new window, with a new number, when it remakes the overlay.
     panel: Option<(u32, Retained<NSWindow>)>,
-    /// A re-home was attempted for this show and the panel has not been seen
-    /// back on the active Space since. It resets when the HUD hides, so each
-    /// show gets one attempt, and when the panel is seen on the active Space,
-    /// so a later Space change that strands it gets one more.
-    rehomed: bool,
+    recovery: Recovery,
+    /// Simulate one persistently unshowable native window in the debug app.
+    #[cfg(debug_assertions)]
+    faulted_window: Option<u32>,
 }
 
 impl DictationIndicatorUi {
@@ -131,12 +132,28 @@ impl DictationIndicatorUi {
         Self {
             hud,
             panel: None,
-            rehomed: false,
+            recovery: Recovery::default(),
+            #[cfg(debug_assertions)]
+            faulted_window: None,
         }
     }
 
     pub(crate) fn handle(&mut self, event: HudEvent) {
+        if matches!(event, HudEvent::Started | HudEvent::Reset) {
+            self.recovery.reset();
+        }
         self.hud.send(event);
+    }
+
+    /// Debug-control fault injection, with no capture, transcription or paste.
+    #[cfg(debug_assertions)]
+    pub(crate) fn hide_native_for_test(&mut self) {
+        if let Some(mtm) = MainThreadMarker::new()
+            && let Some((number, panel)) = self.panel(mtm)
+        {
+            self.faulted_window = Some(number);
+            panel.orderOut(None);
+        }
     }
 
     /// Whether the HUD wants the display's frames: the pump ticks every
@@ -152,7 +169,7 @@ impl DictationIndicatorUi {
         let shown = self.hud.shown.load(Ordering::Acquire);
         if !shown {
             // Each show gets a fresh attempt.
-            self.rehomed = false;
+            self.recovery.reset();
         } else if let Some(mtm) = MainThreadMarker::new() {
             self.rehome_on_active_space(mtm);
         }
@@ -193,39 +210,50 @@ impl DictationIndicatorUi {
     /// Puts a shown HUD back on the active Space. Changing the activation
     /// policy (the Dock icon follows Settings) can tie Rune's panel to one
     /// Space while AppKit still reports `CanJoinAllSpaces`, and Rune repairs
-    /// that only as its panel shows (#1084). Clearing the mask and setting it
-    /// back makes the window server apply it again; the panel is ordered out
-    /// and back in, so this reorders the panel but leaves Rune's presence
-    /// state and alpha alone. It is attempted once per show, and once more
-    /// after the panel has been seen on the active Space again, so a repair
-    /// that did not take cannot loop.
+    /// that only as its panel shows (#1084). Give the queued show time to
+    /// reach AppKit, reassert the intended behaviors once, then replace a
+    /// native window that stays lost. Both an ordered-out panel and one on
+    /// another Space need recovery: Hex's `shown` records intent only.
     fn rehome_on_active_space(&mut self, mtm: MainThreadMarker) {
-        let Some((number, panel)) = self.panel(mtm) else {
-            return;
-        };
-        // Rune applies the queued show later than `shown` flips.
-        if !panel.isVisible() {
-            return;
+        let panel = self.panel(mtm);
+        #[cfg(debug_assertions)]
+        if let Some((number, panel)) = &panel
+            && self.faulted_window == Some(*number)
+        {
+            panel.orderOut(None);
         }
-        if panel.isOnActiveSpace() {
-            // Back where it belongs: a later Space change gets another try.
-            self.rehomed = false;
-            return;
+        let visible = panel.as_ref().is_some_and(|(_, panel)| {
+            panel.isVisible() && panel.isOnActiveSpace() && panel.alphaValue() > 0.0
+        });
+        match self.recovery.observe(Instant::now(), true, visible) {
+            Action::None => {}
+            Action::Rehome => {
+                if let Some((number, panel)) = panel {
+                    panel.orderOut(None);
+                    panel.setCollectionBehavior(NSWindowCollectionBehavior::Default);
+                    panel.setCollectionBehavior(
+                        NSWindowCollectionBehavior::CanJoinAllSpaces
+                            | NSWindowCollectionBehavior::Stationary
+                            | NSWindowCollectionBehavior::IgnoresCycle
+                            | NSWindowCollectionBehavior::FullScreenAuxiliary
+                            | NSWindowCollectionBehavior::CanJoinAllApplications,
+                    );
+                    panel.orderFrontRegardless();
+                    tracing::info!(window = number, "attempted dictation HUD Space recovery");
+                }
+            }
+            Action::Recreate => {
+                tracing::warn!(
+                    window = panel.as_ref().map(|(number, _)| number),
+                    "recreating the dictation HUD after native visibility recovery failed"
+                );
+                self.panel = None;
+                self.hud.overlay.update_if(|hud, _| {
+                    hud.recreate_native();
+                    false
+                });
+            }
         }
-        if self.rehomed {
-            return;
-        }
-        self.rehomed = true;
-        let behavior = panel.collectionBehavior();
-        panel.orderOut(None);
-        panel.setCollectionBehavior(NSWindowCollectionBehavior::Default);
-        panel.setCollectionBehavior(behavior);
-        panel.orderFrontRegardless();
-        tracing::info!(
-            window = number,
-            active_space = panel.isOnActiveSpace(),
-            "re-homed the dictation HUD on the active Space"
-        );
     }
 }
 

@@ -1049,9 +1049,16 @@ impl Pump {
                 pane: None,
             },
             DeveloperCommand::Hud { state } => {
+                #[cfg(debug_assertions)]
+                if state == DeveloperHudState::HideNative {
+                    indicator.hide_native_for_test();
+                    return DeveloperReply::Ok;
+                }
                 indicator.handle(DictationIndicatorEvent::Reset);
                 match state {
                     DeveloperHudState::Reset => {}
+                    #[cfg(debug_assertions)]
+                    DeveloperHudState::HideNative => unreachable!("handled above"),
                     DeveloperHudState::Recording => {
                         indicator.handle(DictationIndicatorEvent::Started);
                         indicator.handle(DictationIndicatorEvent::Meter {
