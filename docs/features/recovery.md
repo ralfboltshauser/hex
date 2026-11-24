@@ -1015,3 +1015,10 @@ concurrent deletion. Commit-error fixtures also assert explicit replay cannot
 bypass an uncertain-commit fence. CLI request tests verify both export commands
 resolve relative destinations in the invoking process without creating files.
 These checks do not exercise native capture or a real target application's paste.
+
+Recovery maintenance schedules transcript-only copies for their 24-hour
+expiry and processes due recording checkpoints before each cleanup batch.
+`expired_audio_does_not_starve_recording_checkpoints` uses the real store with
+eight older copies sorted ahead of a recording. It checks that the audio
+checkpoint advances both while the transcripts are retained and when they
+become due for deletion, and that cleanup still reclaims those copies.

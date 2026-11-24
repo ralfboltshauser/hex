@@ -94,6 +94,14 @@ format, bounds and proof limits. Authoritative focused checks are in
 `scripts/personal/check.sh`; complete upstream checks and signed-package
 verification remain required for publication.
 
+Recovery maintenance shares one expiry deadline between scheduling and
+selection and services due recording checkpoints before cleanup. In the
+November 19 build, transcript-only entries could repeatedly occupy all eight
+maintenance slots and make an active dictation hit the five-second watchdog.
+The recovery checks seed eight such entries, verify that recording progresses
+through both the audio and text expiry phases, and check that expired entries
+are eventually reclaimed.
+
 ## Update and delivery
 
 GitHub Actions is disabled on `ralfboltshauser/hex`; this fork carries no
