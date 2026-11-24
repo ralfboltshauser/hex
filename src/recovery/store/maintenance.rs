@@ -6,11 +6,7 @@ impl Store {
         self.sessions
             .values()
             .filter_map(|session| {
-                if session
-                    .health
-                    .as_ref()
-                    .is_some_and(|health| health.cancelled.load(Ordering::Acquire))
-                {
+                if cancelled(session) {
                     return Some(Duration::from_secs(1));
                 }
                 let snapshot = &session.manifest.as_ref()?.snapshot;
@@ -24,13 +20,8 @@ impl Store {
                 if !resolvable(snapshot) || now_ms < resolved {
                     return None;
                 }
-                let window = if snapshot.audio_removed {
-                    DAY
-                } else {
-                    DAY / 24
-                };
                 Some(
-                    Duration::from_millis(resolved.saturating_add(window).saturating_sub(now_ms))
+                    Duration::from_millis(expiry_at(snapshot, resolved).saturating_sub(now_ms))
                         .max(Duration::from_secs(1)),
                 )
             })
@@ -39,40 +30,39 @@ impl Store {
 
     pub(super) fn maintenance(&mut self) {
         let now = crate::desktop::events::now_ms();
-        let due: Vec<_> = self
+        let tick = Instant::now();
+        // Cleanup batches must yield to recordings with an outstanding checkpoint.
+        let checkpoint_due = |session: &Stored| {
+            tick.duration_since(session.checkpoint) >= CHECKPOINT
+                && session.manifest.as_ref().is_some_and(|manifest| {
+                    !manifest.snapshot.deleting
+                        && manifest.snapshot.capture == CaptureState::Recording
+                })
+        };
+        let checkpoints = self
             .sessions
             .iter()
-            .filter_map(|(id, session)| {
-                if session
-                    .health
-                    .as_ref()
-                    .is_some_and(|health| health.cancelled.load(Ordering::Acquire))
-                {
-                    return Some(id.clone());
-                }
-                let snapshot = &session.manifest.as_ref()?.snapshot;
-                if snapshot.deleting {
-                    return Some(id.clone());
-                }
-                if snapshot.capture == CaptureState::Recording
-                    && session.checkpoint.elapsed() >= CHECKPOINT
-                {
-                    return Some(id.clone());
-                }
-                if eligible(snapshot, now, DAY / 24) {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|(_, session)| checkpoint_due(session));
+        let cleanup = self.sessions.iter().filter_map(|(id, session)| {
+            if cancelled(session) {
+                return (!checkpoint_due(session)).then_some(id);
+            }
+            let snapshot = &session.manifest.as_ref()?.snapshot;
+            (snapshot.deleting
+                || (resolvable(snapshot)
+                    && snapshot
+                        .resolved_ms
+                        .is_some_and(|resolved| now >= expiry_at(snapshot, resolved))))
+            .then_some(id)
+        });
+        let due: Vec<_> = checkpoints
+            .map(|(id, _)| id)
+            .chain(cleanup)
             .take(8)
+            .cloned()
             .collect();
         for id in due {
-            if self.sessions[&id]
-                .health
-                .as_ref()
-                .is_some_and(|health| health.cancelled.load(Ordering::Acquire))
-            {
+            if cancelled(&self.sessions[&id]) {
                 if self.delete(&id).is_err() {
                     tracing::warn!(
                         session = id.as_str(),
@@ -239,6 +229,22 @@ impl Store {
     }
 }
 
+fn cancelled(session: &Stored) -> bool {
+    session
+        .health
+        .as_ref()
+        .is_some_and(|health| health.cancelled.load(Ordering::Acquire))
+}
+
+fn expiry_at(snapshot: &Snapshot, resolved: u64) -> u64 {
+    let window = if snapshot.audio_removed {
+        DAY
+    } else {
+        DAY / 24
+    };
+    resolved.saturating_add(window)
+}
+
 fn resolvable(snapshot: &Snapshot) -> bool {
     snapshot.capture != CaptureState::Recording
         && !snapshot.keep
@@ -268,6 +274,101 @@ fn audio_segment(name: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_audio_does_not_starve_recording_checkpoints() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "hex-recovery-expiry-{}",
+            SessionId::random().unwrap().as_str()
+        ));
+        let result = {
+            let mut store = Store::open(root.clone()).unwrap();
+            let now = crate::desktop::events::now_ms();
+            let mut begin = |index| {
+                let id = SessionId::try_from(format!("{index:032x}")).unwrap();
+                let health = Arc::new(Health {
+                    started: Instant::now(),
+                    ready: AtomicBool::new(false),
+                    cancelled: AtomicBool::new(false),
+                    fault: std::sync::atomic::AtomicU8::new(0),
+                    acknowledged_ms: AtomicU64::new(1),
+                    pending: Default::default(),
+                });
+                store.begin(id.clone(), Default::default(), health).unwrap();
+                id
+            };
+            let expired: Vec<_> = (0..8).map(&mut begin).collect();
+            let active = begin(8);
+            let due_audio = begin(9);
+            for id in expired.iter().chain([&due_audio]) {
+                store.audio(id, 0, vec![0.25; 16]).unwrap();
+                store.checkpoint(id, Some(16)).unwrap();
+                let snapshot = &mut store
+                    .sessions
+                    .get_mut(id)
+                    .unwrap()
+                    .manifest
+                    .as_mut()
+                    .unwrap()
+                    .snapshot;
+                snapshot.user_resolved = true;
+                snapshot.resolved_ms = Some(now - DAY / 12);
+                if id != &due_audio {
+                    store.remove_audio(id).unwrap();
+                }
+            }
+            store.audio(&active, 0, vec![0.25; 16]).unwrap();
+            store.sessions.get_mut(&active).unwrap().checkpoint = Instant::now() - CHECKPOINT;
+            store.maintenance();
+            let first = store.sessions[&active]
+                .manifest
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .samples;
+            let retained_before_expiry = expired.iter().all(|id| store.sessions.contains_key(id));
+            let reclaimed_due_audio = store.sessions[&due_audio]
+                .manifest
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .audio_removed;
+
+            // Even genuine text expiry must yield to a due recording checkpoint.
+            for id in &expired {
+                store
+                    .sessions
+                    .get_mut(id)
+                    .unwrap()
+                    .manifest
+                    .as_mut()
+                    .unwrap()
+                    .snapshot
+                    .resolved_ms = Some(now - DAY);
+            }
+            store.audio(&active, 16, vec![0.25; 16]).unwrap();
+            store.sessions.get_mut(&active).unwrap().checkpoint = Instant::now() - CHECKPOINT;
+            store.maintenance();
+            let second = store.sessions[&active]
+                .manifest
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .samples;
+            store.maintenance();
+            let removed_after_expiry = expired.iter().all(|id| !store.sessions.contains_key(id));
+            (
+                first,
+                retained_before_expiry,
+                reclaimed_due_audio,
+                second,
+                removed_after_expiry,
+            )
+        };
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result, (16, true, true, 32, true));
+    }
+
     #[test]
     fn unresolved_failures_and_running_retries_never_expire() {
         let mut snapshot = Snapshot {
